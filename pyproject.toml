@@ -1,0 +1,62 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dnsmonitor"
+version = "0.1.0"
+description = "DNS monitoring tool for traffic, resolution path, and cache analysis"
+readme = "README.md"
+requires-python = ">=3.12"
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+dependencies = [
+    "pcapy-ng>=1.0.0",
+    "dpkt>=1.9.8",
+    "dnspython>=2.3.0",
+    "scapy>=2.4.5",
+    "psutil>=5.9.0",
+    "click>=8.0.0",
+    "pyyaml>=6.0",
+    "colorama>=0.4.6",
+    "colorlog>=6.7.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-cov>=4.0.0",
+    "black>=22.0.0",
+    "flake8>=5.0.0",
+    "mypy>=1.0.0",
+]
+
+[project.scripts]
+dnsm = "dnsmonitor.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/example/dnsmonitor"
+Repository = "https://github.com/example/dnsmonitor"
+Issues = "https://github.com/example/dnsmonitor/issues"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.black]
+line-length = 88
+target-version = ['py312']
+
+[tool.mypy]
+python_version = "3.12"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
