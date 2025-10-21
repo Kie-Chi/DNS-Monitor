@@ -119,3 +119,5 @@ ERROR_CODES = {
     "TIMEOUT_ERROR": 5,
     "PARSE_ERROR": 6,
 }
+
+# --- Alias Name ---

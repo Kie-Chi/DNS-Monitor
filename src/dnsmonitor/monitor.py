@@ -8,12 +8,12 @@ import signal
 from typing import Optional, Dict, Any
 from datetime import datetime
 
-from config import MonitorConfig
-from traffic import TrafficMonitor
-from resolver import ResolverMonitor
-from cache import CacheMonitor
-from utils.logger import setup_logger, get_logger, log_system_info, PerformanceLogger
-from utils import Colors, colorize
+from .config import MonitorConfig
+from .traffic import TrafficMonitor
+from .resolver import ResolverMonitor
+from .cache import CacheMonitor
+from .utils.logger import setup_logger, get_logger, log_system_info, PerformanceLogger
+from .utils import Colors, colorize
 
 
 class DNSMonitor:
@@ -25,7 +25,7 @@ class DNSMonitor:
         # Setup logging first
         setup_logger(
             debug=(config.log_level.upper() == 'DEBUG'),
-            log_file=config.log_file
+            log_file=getattr(config, 'log_file', None)
         )
         self.logger = get_logger(__name__)
         
@@ -61,29 +61,36 @@ class DNSMonitor:
         """Initialize monitoring components based on configuration"""
         try:
             # Initialize traffic monitor
-            if self.config.enable_traffic_monitoring:
+            if hasattr(self.config, 'enable_traffic_monitoring') and self.config.enable_traffic_monitoring:
                 self.traffic_monitor = TrafficMonitor(
-                    self.config.traffic_config,
-                    self.logger.getChild('traffic')
+                    self.config.traffic,
+                    # legacy: pass logger child if supported
                 )
+                self.stats['components_active'].append('traffic')
+                self.logger.info("Traffic monitoring component initialized")
+            elif hasattr(self.config, 'traffic'):
+                # If no explicit enable flag, still initialize if traffic present
+                self.traffic_monitor = TrafficMonitor(self.config.traffic)
                 self.stats['components_active'].append('traffic')
                 self.logger.info("Traffic monitoring component initialized")
             
             # Initialize resolver monitor
-            if self.config.enable_resolver_monitoring:
-                self.resolver_monitor = ResolverMonitor(
-                    self.config.resolver_config,
-                    self.logger.getChild('resolver')
-                )
+            if hasattr(self.config, 'enable_resolver_monitoring') and self.config.enable_resolver_monitoring:
+                self.resolver_monitor = ResolverMonitor(self.config.resolver)
+                self.stats['components_active'].append('resolver')
+                self.logger.info("Resolver path monitoring component initialized")
+            elif hasattr(self.config, 'resolver'):
+                self.resolver_monitor = ResolverMonitor(self.config.resolver)
                 self.stats['components_active'].append('resolver')
                 self.logger.info("Resolver path monitoring component initialized")
             
             # Initialize cache monitor
-            if self.config.enable_cache_monitoring:
-                self.cache_monitor = CacheMonitor(
-                    self.config.cache_config,
-                    self.logger.getChild('cache')
-                )
+            if hasattr(self.config, 'enable_cache_monitoring') and self.config.enable_cache_monitoring:
+                self.cache_monitor = CacheMonitor(self.config.cache)
+                self.stats['components_active'].append('cache')
+                self.logger.info("Cache monitoring component initialized")
+            elif hasattr(self.config, 'cache'):
+                self.cache_monitor = CacheMonitor(self.config.cache)
                 self.stats['components_active'].append('cache')
                 self.logger.info("Cache monitoring component initialized")
             
@@ -269,25 +276,25 @@ class DNSMonitor:
         print(f"Start time: {colorize(datetime.now().strftime('%Y-%m-%d %H:%M:%S'), Colors.GREEN)}")
         print(f"Log level: {colorize(self.config.log_level.upper(), Colors.YELLOW)}")
         
-        if self.config.log_file:
+        if getattr(self.config, 'log_file', None):
             print(f"Log file: {colorize(self.config.log_file, Colors.YELLOW)}")
         
         print(f"\n{Colors.BOLD}Active Components:{Colors.RESET}")
         
         if self.traffic_monitor:
             print(f"  {colorize('✓', Colors.GREEN)} Traffic Monitor")
-            print(f"    - Interface: {self.config.traffic_config.interface}")
-            print(f"    - Output: {self.config.traffic_config.output_dir}")
+            print(f"    - Interface: {self.config.traffic.interface}")
+            print(f"    - Output: {self.config.traffic.pcap_dir}")
         
         if self.resolver_monitor:
             print(f"  {colorize('✓', Colors.GREEN)} Resolver Path Monitor")
-            print(f"    - Client: {self.config.resolver_config.client_ip}")
-            print(f"    - Resolver: {self.config.resolver_config.resolver_ip}")
+            print(f"    - Client: {self.config.resolver.client_ip}")
+            print(f"    - Resolver: {self.config.resolver.resolver_ip}")
         
         if self.cache_monitor:
             print(f"  {colorize('✓', Colors.GREEN)} Cache Monitor")
-            print(f"    - Server: {self.config.cache_config.server_type}")
-            print(f"    - Interval: {self.config.cache_config.interval}s")
+            print(f"    - Server: {self.config.cache.server_type}")
+            print(f"    - Interval: {self.config.cache.interval}s")
         
         print(f"{Colors.CYAN}{'='*60}{Colors.RESET}\n")
     

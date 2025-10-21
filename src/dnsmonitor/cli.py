@@ -6,10 +6,10 @@ import click
 import sys
 from typing import Optional
 
-from config import load_config, create_default_config
-from monitor import DNSMonitor
-from utils.logger import setup_logger, get_logger
-from utils import print_header, print_info, print_error, Colors
+from .config import ConfigManager
+from .monitor import DNSMonitor
+from .utils.logger import setup_logger, get_logger
+from .utils import print_header, print_info, print_error, Colors
 
 
 @click.group()
@@ -33,11 +33,12 @@ def cli(ctx, config: Optional[str], log_level: str, log_file: Optional[str]):
     
     # Load configuration
     try:
-        if config:
-            config_obj = load_config(config)
-        else:
-            config_obj = create_default_config()
-        ctx.obj['config'] = config_obj
+        config_manager = ConfigManager(config)
+        ctx.obj['config_manager'] = config_manager
+        ctx.obj['config'] = config_manager.get_config()
+        # override log level if provided
+        ctx.obj['config'].log_level = log_level
+        ctx.obj['config'].log_file = log_file if log_file else None
     except Exception as e:
         print_error(f"Failed to load configuration: {e}")
         sys.exit(1)
@@ -66,6 +67,7 @@ def monitor(ctx, interface: Optional[str], client_ip: Optional[str],
     if resolver_ip:
         config.resolver.resolver_ip = resolver_ip
     if cache_software:
+        config.cache.server_type = cache_software
         config.cache.software = cache_software
     if output_dir:
         config.output_dir = output_dir
@@ -78,7 +80,7 @@ def monitor(ctx, interface: Optional[str], client_ip: Optional[str],
     print_info(f"Output Directory: {config.output_dir}")
     
     try:
-        monitor = DNSMonitor(config, logger)
+        monitor = DNSMonitor(config)
         monitor.start()
     except KeyboardInterrupt:
         print_info("Monitoring stopped by user")
@@ -165,22 +167,27 @@ def resolver(ctx, client_ip: str, resolver_ip: str, timeout: Optional[int]):
               required=True, help='DNS cache software type')
 @click.option('--host', help='Cache server host')
 @click.option('--port', type=int, help='Cache server port')
+@click.option('--interval', type=int, help='Cache monitor interval seconds')
 @click.pass_context
-def cache(ctx, software: str, host: Optional[str], port: Optional[int]):
+def cache(ctx, software: str, host: Optional[str], port: Optional[int], interval: Optional[int]):
     """Monitor DNS cache changes"""
     config = ctx.obj['config']
     logger = ctx.obj['logger']
     
+    config.cache.server_type = software
     config.cache.software = software
     if host:
         config.cache.host = host
     if port:
         config.cache.port = port
+    if interval:
+        config.cache.interval = interval
     
     print_header("DNS Cache Monitor Starting")
     print_info(f"Software: {config.cache.software}")
     print_info(f"Host: {config.cache.host}")
     print_info(f"Port: {config.cache.port}")
+    print_info(f"Interval: {config.cache.interval}s")
     
     try:
         from .cache import CacheMonitor

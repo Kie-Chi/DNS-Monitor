@@ -11,7 +11,6 @@ try:
     import pcapy
 except ImportError:
     print("Warning: pcapy not available, using mock implementation")
-    import pcapy_mock as pcapy
 import dpkt
 from dpkt.dns import DNS
 

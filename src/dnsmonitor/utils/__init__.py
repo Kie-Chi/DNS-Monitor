@@ -8,7 +8,7 @@ This package contains utility functions and classes for DNS Monitor:
 """
 
 # Import color utilities for backward compatibility
-from colors import (
+from .colors import (
     Colors,
     colorize,
     print_header,
@@ -21,7 +21,7 @@ from colors import (
 )
 
 # Import common utilities
-from common import (
+from .common import (
     ensure_directory,
     get_timestamp,
     get_file_size,
@@ -34,7 +34,7 @@ from common import (
 )
 
 # Import logger utilities
-from logger import (
+from .logger import (
     setup_logger,
     get_logger,
     PerformanceLogger,

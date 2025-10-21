@@ -6,14 +6,21 @@ import threading
 import subprocess
 import json
 import socket
-from typing import Dict, List, Optional, Any, Set, Tuple
+import re
+import sys
+from abc import ABC, abstractmethod
+from typing import Dict, List, Optional, Any, Set, Tuple, override
 from datetime import datetime, timedelta
 from dataclasses import dataclass, asdict
 from pathlib import Path
 
-from config import CacheConfig
-from utils.logger import get_logger
-from utils import Colors, colorize
+from watchdog.observers import Observer
+from watchdog.events import FileSystemEventHandler
+
+from .config import CacheConfig, CacheCommonConfig, BindCacheConfig, UnboundCacheConfig
+from .utils.logger import get_logger
+from .utils import Colors, colorize
+from .utils.common import get_timestamp, save_json
 
 
 class DNSCacheRecord:
@@ -99,14 +106,14 @@ class CacheDiff:
         
         self.added_records: List[DNSCacheRecord] = []
         self.removed_records: List[DNSCacheRecord] = []
-        self.modified_records: List[Tuple[DNSCacheRecord, DNSCacheRecord]] = []
+        self.modified_records: List[Dict[str, Any]] = []
         
         self._calculate_diff()
     
     def _calculate_diff(self) -> None:
         """Calculate differences between snapshots"""
-        old_keys = set(self.old_snapshot.records.keys())
-        new_keys = set(self.new_snapshot.records.keys())
+        old_keys: Set[Tuple[str, str]] = set(self.old_snapshot.records.keys())
+        new_keys: Set[Tuple[str, str]] = set(self.new_snapshot.records.keys())
         
         # Find added records
         for key in new_keys - old_keys:
@@ -121,9 +128,18 @@ class CacheDiff:
             old_record = self.old_snapshot.records[key]
             new_record = self.new_snapshot.records[key]
             
-            if (old_record.rdata != new_record.rdata or 
-                abs(old_record.ttl - new_record.ttl) > 1):  # Allow 1 second TTL difference
-                self.modified_records.append((old_record, new_record))
+            data_changed = old_record.rdata != new_record.rdata
+            ttl_changed = old_record.ttl > new_record.ttl
+            if data_changed or ttl_changed:
+                self.modified_records.append({
+                    'old': old_record.to_dict(),
+                    'new': new_record.to_dict(),
+                    'reason': {
+                        'description': 'Data Changed' if data_changed else 'TTL Changed',
+                        'old': old_record.rdata if data_changed else old_record.ttl,
+                        'new': new_record.rdata if data_changed else new_record.ttl
+                    }
+                })
     
     def has_changes(self) -> bool:
         """Check if there are any changes"""
@@ -148,57 +164,127 @@ class CacheDiff:
             'removed_records': [record.to_dict() for record in self.removed_records],
             'modified_records': [
                 {
-                    'old': old.to_dict(),
-                    'new': new.to_dict()
+                    'old': record['old'],
+                    'new': record['new'],
+                    'reason': record['reason']
                 }
-                for old, new in self.modified_records
+                for record in self.modified_records
             ]
         }
 
 
-class BindCacheMonitor:
-    """BIND DNS cache monitor using rndc"""
-    
+class AbstractCacheMonitor(ABC):
+
     def __init__(self, config: CacheConfig):
         self.config = config
         self.logger = get_logger(__name__)
-        self.rndc_key_file = config.bind_rndc_key or "/etc/bind/rndc.key"
-        self.dump_file = config.bind_dump_file or "/var/cache/bind/named_dump.db"
+
+    @abstractmethod
+    def dump_cache(self, **kwargs) -> str:
+        """Dump cache using appropriate method"""
+        pass
+
+    @abstractmethod
+    def parse_cache(self, cache_content: str) -> CacheSnapshot:
+        """Parse cache content into CacheSnapshot"""
+        pass
+
+class FileChangeHandler(FileSystemEventHandler):
+    def __init__(self, dump_filename: str, file_modified: threading.Event):
+        self.dump_filename = dump_filename
+        self.file_modified = file_modified
+        
+    def on_modified(self, event):
+        if not event.is_directory and event.src_path.endswith(self.dump_filename):
+            self.file_modified.set()
+
+class BindCacheMonitor(AbstractCacheMonitor):
+    """BIND DNS cache monitor using rndc"""
     
-    def dump_cache(self) -> bool:
-        """Dump BIND cache using rndc"""
+    def __init__(self, config: CacheConfig):
+        super().__init__(config)
+        self.rndc_key_file = config.bind.rndc_key_file or "/usr/local/etc/bind/rndc.key"
+        self.dump_file = config.bind.dump_file or "/usr/local/var/cache/bind/named_dump.db"
+    
+    @override
+    def dump_cache(self, **kwargs) -> str:
+        """Dump BIND cache using rndc with file change notification
+        
+        Returns:
+            str: The content of the cache dump file, or empty string on failure
+        """
+        max_wait_time = float(kwargs.get('max_wait_time', 1.0))
         try:
-            cmd = ["rndc", "-k", self.rndc_key_file, "dumpdb", "-cache"]
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+            dump_path = Path(self.dump_file)
+            old_mtime = dump_path.stat().st_mtime if dump_path.exists() else 0
+            file_modified = threading.Event()
+            dump_dir = dump_path.parent
+            dump_filename = dump_path.name
+            observer = Observer()
+            handler = FileChangeHandler(dump_filename, file_modified)
+            observer.schedule(handler, dump_dir, recursive=False)
+            observer.start()
             
-            if result.returncode != 0:
-                self.logger.error(f"rndc dump failed: {result.stderr}")
-                return False
-            
-            # Wait for dump file to be created/updated
-            time.sleep(1)
-            return os.path.exists(self.dump_file)
-            
+            try:
+                cmd = ["rndc", "-k", self.rndc_key_file, "dumpdb", "-cache"]
+                result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+                
+                if result.returncode != 0:
+                    self.logger.error(f"rndc dump failed: {result.stderr}")
+                    return ""
+                
+                # Wait for notification or timeout
+                if file_modified.wait(timeout=max_wait_time):
+                    self.logger.debug("Received file modification notification")
+                    if dump_path.exists():
+                        current_mtime = dump_path.stat().st_mtime
+                        if current_mtime > old_mtime:
+                            self.logger.debug(f"Dump file updated successfully")
+                            try:
+                                with open(self.dump_file, 'r', encoding='utf-8', errors='ignore') as f:
+                                    return f.read()
+                            except Exception as e:
+                                self.logger.error(f"Failed to read dump file: {e}")
+                                return ""
+                
+                self.logger.warning(f"Dump file not updated within {max_wait_time}s timeout")
+                if dump_path.exists():
+                    try:
+                        with open(self.dump_file, 'r', encoding='utf-8', errors='ignore') as f:
+                            return f.read()
+                    except Exception as e:
+                        self.logger.error(f"Failed to read dump file: {e}")
+                return ""
+                
+            finally:
+                # Clean up observer
+                observer.stop()
+                observer.join(timeout=1.0)
+                
         except subprocess.TimeoutExpired:
-            self.logger.error("rndc dump timed out")
-            return False
+            self.logger.error("rndc dump command timed out")
+            return ""
         except Exception as e:
             self.logger.error(f"Failed to dump BIND cache: {e}")
-            return False
+            return ""
     
-    def parse_cache(self) -> CacheSnapshot:
-        """Parse BIND cache dump file"""
+    @override
+    def parse_cache(self, cache_data: str) -> CacheSnapshot:
+        """Parse BIND cache dump data
+        
+        Args:
+            cache_data (str): The cache data to parse
+            
+        Returns:
+            CacheSnapshot: The parsed cache snapshot
+        """
         snapshot = CacheSnapshot()
         
         try:
-            with open(self.dump_file, 'r', encoding='utf-8', errors='ignore') as f:
-                content = f.read()
-            
-            # Parse cache entries using regex
             # BIND cache format: name ttl class type rdata
             cache_pattern = r'^([^\s]+)\s+(\d+)\s+IN\s+([A-Z]+)\s+(.+)$'
             
-            for line in content.split('\n'):
+            for line in cache_data.split('\n'):
                 line = line.strip()
                 if not line or line.startswith(';'):
                     continue
@@ -217,17 +303,19 @@ class BindCacheMonitor:
             return snapshot
 
 
-class UnboundCacheMonitor:
+class UnboundCacheMonitor(AbstractCacheMonitor):
     """Unbound DNS cache monitor using unbound-control"""
     
     def __init__(self, config: CacheConfig):
-        self.config = config
-        self.logger = get_logger(__name__)
+        super().__init__(config)
     
-    def dump_cache(self) -> str:
+    @override
+    def dump_cache(self, **kwargs) -> str:  
         """Dump Unbound cache using unbound-control"""
         try:
             cmd = ["unbound-control", "dump_cache"]
+            if self.config.unbound.control_config:
+                cmd = ["unbound-control", "-c", self.config.unbound.control_config, "dump_cache"]
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
             
             if result.returncode != 0:
@@ -243,8 +331,16 @@ class UnboundCacheMonitor:
             self.logger.error(f"Failed to dump Unbound cache: {e}")
             return ""
     
+    @override
     def parse_cache(self, cache_data: str) -> CacheSnapshot:
-        """Parse Unbound cache data"""
+        """Parse Unbound cache data
+        
+        Args:
+            cache_data (str): The cache data to parse
+            
+        Returns:
+            CacheSnapshot: The parsed cache snapshot
+        """
         snapshot = CacheSnapshot()
         
         try:
@@ -277,7 +373,7 @@ class UnboundCacheMonitor:
 class CacheAnalysisServer:
     """TCP server for cache analysis requests (similar to unbound.py)"""
     
-    def __init__(self, cache_monitor, port: int = 9999):
+    def __init__(self, cache_monitor: 'CacheMonitor', port: int = 9999):
         self.cache_monitor = cache_monitor
         self.port = port
         self.server_socket = None
@@ -289,7 +385,7 @@ class CacheAnalysisServer:
         try:
             self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            self.server_socket.bind(('localhost', self.port))
+            self.server_socket.bind(('0.0.0.0', self.port))
             self.server_socket.listen(5)
             
             self.running = True
@@ -362,13 +458,8 @@ class CacheMonitor:
         self.logger = get_logger(__name__)
         self.running = False
         
-        # Initialize appropriate cache monitor
-        if config.server_type.lower() == 'bind':
-            self.cache_impl = BindCacheMonitor(config)
-        elif config.server_type.lower() == 'unbound':
-            self.cache_impl = UnboundCacheMonitor(config)
-        else:
-            raise ValueError(f"Unsupported DNS server type: {config.server_type}")
+        # Reflect registry
+        self.cache_impl = self._cache_impl(config)
         
         # Cache snapshots
         self.previous_snapshot: Optional[CacheSnapshot] = None
@@ -376,8 +467,8 @@ class CacheMonitor:
         
         # Analysis server
         self.analysis_server = None
-        if config.enable_analysis_server:
-            self.analysis_server = CacheAnalysisServer(self, config.analysis_port)
+        if config.common.enable_analysis_server:
+            self.analysis_server = CacheAnalysisServer(self, config.common.analysis_port)
         
         # Statistics
         self.stats = {
@@ -387,6 +478,18 @@ class CacheMonitor:
             'records_removed': 0,
             'records_modified': 0,
         }
+    
+    def _cache_impl(self, config: CacheConfig) -> AbstractCacheMonitor:
+        """Reflectively get cache monitor implementation"""
+        server_type = config.server_type.lower()
+        impl_class_name = f"{server_type.capitalize()}CacheMonitor"
+        current_module = sys.modules[__name__]
+        if hasattr(current_module, impl_class_name):
+            impl_class = getattr(current_module, impl_class_name)
+            if issubclass(impl_class, AbstractCacheMonitor):
+                self.logger.debug(f"Using {impl_class_name} for {config.server_type} cache monitoring")
+                return impl_class(config)
+        raise ValueError(f"Unsupported DNS server type: {config.server_type}")
     
     def start(self) -> None:
         """Start cache monitoring"""
@@ -437,7 +540,7 @@ class CacheMonitor:
                 # Take new snapshot
                 new_snapshot = self._take_snapshot()
                 if not new_snapshot:
-                    time.sleep(self.config.interval)
+                    time.sleep(self.config.common.interval)
                     continue
                 
                 # Compare with previous snapshot
@@ -462,25 +565,19 @@ class CacheMonitor:
                     self._print_status()
                     last_report_time = current_time
                 
-                time.sleep(self.config.interval)
+                time.sleep(self.config.common.interval)
                 
             except Exception as e:
                 self.logger.error(f"Error in monitoring loop: {e}")
-                time.sleep(self.config.interval)
+                time.sleep(self.config.common.interval)
     
     def _take_snapshot(self) -> Optional[CacheSnapshot]:
         """Take a cache snapshot"""
         try:
-            if isinstance(self.cache_impl, BindCacheMonitor):
-                if self.cache_impl.dump_cache():
-                    return self.cache_impl.parse_cache()
-            elif isinstance(self.cache_impl, UnboundCacheMonitor):
-                cache_data = self.cache_impl.dump_cache()
-                if cache_data:
-                    return self.cache_impl.parse_cache(cache_data)
-            
+            cache_data = self.cache_impl.dump_cache()
+            if cache_data:
+                return self.cache_impl.parse_cache(cache_data)
             return None
-            
         except Exception as e:
             self.logger.error(f"Failed to take cache snapshot: {e}")
             return None
@@ -509,16 +606,18 @@ class CacheMonitor:
             self.logger.info(f"  ... and {len(diff.removed_records) - 5} more removed records")
         
         # Log modified records
-        for old_record, new_record in diff.modified_records[:3]:  # Limit to first 3
-            self.logger.info(f"  {colorize('MODIFIED', Colors.YELLOW)}: {old_record.name}")
-            self.logger.info(f"    Old: {old_record.rdata} (TTL: {old_record.ttl})")
-            self.logger.info(f"    New: {new_record.rdata} (TTL: {new_record.ttl})")
+        for mod in diff.modified_records[:3]:  # Limit to first 3
+            old_record = mod['old']
+            new_record = mod['new']
+            self.logger.info(f"  {colorize('MODIFIED', Colors.YELLOW)}: {old_record['name']}")
+            self.logger.info(f"    Old: {old_record['data']} (TTL: {old_record['ttl']})")
+            self.logger.info(f"    New: {new_record['data']} (TTL: {new_record['ttl']})")
         
         if len(diff.modified_records) > 3:
             self.logger.info(f"  ... and {len(diff.modified_records) - 3} more modified records")
         
         # Save detailed changes if configured
-        if self.config.save_changes:
+        if self.config.common.save_changes:
             self._save_cache_changes(diff)
     
     def _print_cache_summary(self, snapshot: CacheSnapshot) -> None:
@@ -563,7 +662,7 @@ class CacheMonitor:
             stats_data = {
                 'config': {
                     'server_type': self.config.server_type,
-                    'interval': self.config.interval,
+                    'interval': self.config.common.interval,
                 },
                 'statistics': self.stats,
                 'final_snapshot': self.current_snapshot.to_dict() if self.current_snapshot else None,

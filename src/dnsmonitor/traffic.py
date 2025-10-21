@@ -2,25 +2,99 @@
 
 import time
 import threading
-import queue
-import json
-import struct
+import os
+import signal
+import socket
 from pathlib import Path
-from typing import Dict, List, Optional, Any, Tuple
+from typing import Dict, List, Optional, Any, Tuple, Set
 from datetime import datetime
+from dataclasses import dataclass, field
+from ipaddress import IPv4Address, IPv6Address
 
 try:
     import pcapy
 except ImportError:
     print("Warning: pcapy not available, using mock implementation")
-    import pcapy_mock as pcapy
 import dpkt
 from dpkt.dns import DNS
 
-from config import TrafficConfig
-from utils.logger import get_logger
+from .config import TrafficConfig
+from .utils.logger import get_logger
+from .utils.common import ensure_directory, rotate_file, save_json, get_timestamp
 
 
+@dataclass(slots=True)
+class Packet:
+    """DNS Packet"""
+    timestamp: float
+    src_ip: str
+    dst_ip: str
+    src_port: int
+    dst_port: int
+    protocol: str = "UDP"  # UDP or TCP
+    
+    # DNS fields
+    query_id: int = 0
+    is_response: bool = False
+    opcode: int = 0
+    rcode: int = 0
+    flags: Dict[str, bool] = field(default_factory=dict)
+    
+    # DNS sections
+    questions: List[Dict[str, Any]] = field(default_factory=list)
+    answers: List[Dict[str, Any]] = field(default_factory=list)
+    authorities: List[Dict[str, Any]] = field(default_factory=list)
+    additionals: List[Dict[str, Any]] = field(default_factory=list)
+    
+    # Raw data
+    raw_data: bytes = field(default=b"", repr=False)
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert packet to dictionary representation"""
+        result = {
+            "timestamp": self.timestamp,
+            "src_ip": self.src_ip,
+            "dst_ip": self.dst_ip,
+            "src_port": self.src_port,
+            "dst_port": self.dst_port,
+            "protocol": self.protocol,
+            "query_id": self.query_id,
+            "is_response": self.is_response,
+            "opcode": self.opcode,
+            "rcode": self.rcode,
+            "flags": self.flags,
+            "questions": self.questions,
+            "answers": self.answers,
+            "authorities": self.authorities,
+            "additionals": self.additionals
+        }
+        return result
+    
+    @property
+    def qname(self) -> str:
+        """Get query domain name (first question's name)"""
+        if self.questions:
+            return self.questions[0].get("name", "")
+        return ""
+    
+    @property
+    def qtype(self) -> str:
+        """Get query type (first question's type)"""
+        if self.questions:
+            return self.questions[0].get("type", "")
+        return ""
+    
+    @property
+    def response_time(self) -> Optional[float]:
+        """Get response time (if this is a response packet)"""
+        if self.is_response and hasattr(self, "_query_time"):
+            return self.timestamp - getattr(self, "_query_time")
+        return None
+    
+    def set_query_time(self, query_time: float) -> None:
+        """Set query time (for response time calculation)"""
+        self._query_time = query_time
+        
 class DNSPacketAnalyzer:
     """DNS packet analyzer using dpkt"""
     
@@ -37,164 +111,206 @@ class DNSPacketAnalyzer:
             'servers': set(),
         }
     
-    def analyze_packet(self, timestamp: float, packet_data: bytes) -> Optional[Dict[str, Any]]:
-        """Analyze a single packet and extract DNS information"""
+    def analyze_packet(self, timestamp: float, packet_data: bytes) -> Optional[Packet]:
+        """Analyze a single packet and extract DNS information
+        
+        Args:
+            timestamp: Packet capture timestamp
+            packet_data: Raw packet data
+            
+        Returns:
+            Packet: Parsed DNS packet object if it's a DNS packet, None otherwise
+        """
         try:
             self.stats['total_packets'] += 1
-            
-            # Parse Ethernet frame
             eth = dpkt.ethernet.Ethernet(packet_data)
-            
-            # Check if it's IP
             if not isinstance(eth.data, dpkt.ip.IP):
                 return None
-            
             ip = eth.data
-            
-            # Check if it's UDP
-            if not isinstance(ip.data, dpkt.udp.UDP):
+            src_ip = socket.inet_ntoa(ip.src)
+            dst_ip = socket.inet_ntoa(ip.dst)
+            protocol = ""
+            if isinstance(ip.data, dpkt.udp.UDP):
+                udp = ip.data
+                src_port = udp.sport
+                dst_port = udp.dport
+                protocol = "UDP"
+                transport_data = udp.data
+                if udp.sport != 53 and udp.dport != 53:
+                    return None
+            elif isinstance(ip.data, dpkt.tcp.TCP):
+                tcp = ip.data
+                src_port = tcp.sport
+                dst_port = tcp.dport
+                protocol = "TCP"
+                transport_data = tcp.data
+                if tcp.sport != 53 and tcp.dport != 53:
+                    return None
+            else:
                 return None
-            
-            udp = ip.data
-            
-            # Check if it's DNS (port 53)
-            if udp.sport != 53 and udp.dport != 53:
-                return None
-            
-            # Parse DNS
+                
             try:
-                dns = dpkt.dns.DNS(udp.data)
+                dns = dpkt.dns.DNS(transport_data)
             except (dpkt.dpkt.NeedData, dpkt.dpkt.UnpackError):
+                self.stats['errors'] += 1
                 return None
             
             self.stats['dns_packets'] += 1
             
-            # Extract packet information
-            packet_info = {
-                'timestamp': timestamp,
-                'src_ip': self._ip_to_str(ip.src),
-                'dst_ip': self._ip_to_str(ip.dst),
-                'src_port': udp.sport,
-                'dst_port': udp.dport,
-                'dns_id': dns.id,
-                'is_query': dns.qr == 0,
-                'opcode': dns.opcode,
-                'rcode': dns.rcode,
-                'questions': [],
-                'answers': [],
-                'authorities': [],
-                'additionals': [],
+            packet = Packet(
+                timestamp=timestamp,
+                src_ip=src_ip,
+                dst_ip=dst_ip,
+                src_port=src_port,
+                dst_port=dst_port,
+                protocol=protocol,
+                query_id=dns.id,
+                is_response=dns.qr == 1,
+                opcode=dns.opcode,
+                rcode=dns.rcode,
+                raw_data=packet_data
+            )
+            
+            packet.flags = {
+                'qr': dns.qr == 1,  # 1 for response, 0 for query
+                'aa': dns.aa == 1,  # Authoritative Answer
+                'tc': dns.tc == 1,  # Truncated
+                'rd': dns.rd == 1,  # Recursion Desired
+                'ra': dns.ra == 1,  # Recursion Available
+                'z': dns.z == 1,    # Reserved
+                'ad': dns.ad == 1,  # Authentic Data (DNSSEC)
+                'cd': dns.cd == 1   # Checking Disabled (DNSSEC)
             }
             
-            # Update statistics
-            if packet_info['is_query']:
-                self.stats['queries'] += 1
-                self.stats['clients'].add(packet_info['src_ip'])
-                self.stats['servers'].add(packet_info['dst_ip'])
-            else:
-                self.stats['responses'] += 1
-                self.stats['clients'].add(packet_info['dst_ip'])
-                self.stats['servers'].add(packet_info['src_ip'])
-                
-                # Count response codes
-                rcode_name = self._get_rcode_name(dns.rcode)
-                self.stats['response_codes'][rcode_name] = self.stats['response_codes'].get(rcode_name, 0) + 1
-            
-            # Parse questions
             for question in dns.qd:
-                qname = question.name.decode('utf-8', errors='ignore')
-                qtype = self._get_qtype_name(question.type)
-                packet_info['questions'].append({
-                    'name': qname,
-                    'type': qtype,
+                q_name = question.name.decode('utf-8', errors='replace')
+                q_type = self._get_qtype_name(question.type)
+                
+                # Update query type statistics
+                if q_type not in self.stats['query_types']:
+                    self.stats['query_types'][q_type] = 0
+                self.stats['query_types'][q_type] += 1
+                
+                packet.questions.append({
+                    'name': q_name,
+                    'type': q_type,
                     'class': question.cls
                 })
-                
-                # Count query types
-                if packet_info['is_query']:
-                    self.stats['query_types'][qtype] = self.stats['query_types'].get(qtype, 0) + 1
             
-            # Parse answers
             for answer in dns.an:
-                packet_info['answers'].append(self._parse_rr(answer))
-            
-            # Parse authorities
+                packet.answers.append(self._parse_rr(answer))
             for auth in dns.ns:
-                packet_info['authorities'].append(self._parse_rr(auth))
+                packet.authorities.append(self._parse_rr(auth))
+            for additional in dns.ar:
+                packet.additionals.append(self._parse_rr(additional))
+            if not packet.is_response:
+                self.stats['queries'] += 1
+                if packet.src_ip not in self.stats['clients']:
+                    self.stats['clients'].add(packet.src_ip)
+            else:
+                self.stats['responses'] += 1
+                if packet.src_ip not in self.stats['servers']:
+                    self.stats['servers'].add(packet.src_ip)
+                
+                rcode_name = self._get_rcode_name(packet.rcode)
+                if rcode_name not in self.stats['response_codes']:
+                    self.stats['response_codes'][rcode_name] = 0
+                self.stats['response_codes'][rcode_name] += 1
             
-            # Parse additionals
-            for add in dns.ar:
-                packet_info['additionals'].append(self._parse_rr(add))
-            
-            return packet_info
+            return packet
             
         except Exception as e:
             self.stats['errors'] += 1
-            logging.debug(f"Error analyzing packet: {e}")
             return None
     
-    def _ip_to_str(self, ip_bytes: bytes) -> str:
-        """Convert IP bytes to string"""
-        return '.'.join(str(b) for b in ip_bytes)
+    def _parse_rr(self, rr) -> Dict[str, Any]:
+        """Parse a DNS resource record"""
+        try:
+            name = rr.name.decode('utf-8', errors='replace')
+            rr_type = self._get_dns_type(rr.type)
+            ttl = rr.ttl
+            
+            # Parse different record types
+            rdata = {}
+            
+            if rr.type == dpkt.dns.DNS_A:
+                rdata['address'] = socket.inet_ntoa(rr.rdata)
+            elif rr.type == dpkt.dns.DNS_AAAA:
+                rdata['address'] = socket.inet_ntop(socket.AF_INET6, rr.rdata)
+            elif rr.type == dpkt.dns.DNS_CNAME:
+                rdata['cname'] = rr.cname.decode('utf-8', errors='replace')
+            elif rr.type == dpkt.dns.DNS_MX:
+                rdata['preference'] = rr.preference
+                rdata['name'] = rr.name.decode('utf-8', errors='replace')
+            elif rr.type == dpkt.dns.DNS_NS:
+                rdata['name'] = rr.nsname.decode('utf-8', errors='replace')
+            elif rr.type == dpkt.dns.DNS_PTR:
+                rdata['name'] = rr.ptrname.decode('utf-8', errors='replace')
+            elif rr.type == dpkt.dns.DNS_SOA:
+                rdata['mname'] = rr.mname.decode('utf-8', errors='replace')
+                rdata['rname'] = rr.rname.decode('utf-8', errors='replace')
+                rdata['serial'] = rr.serial
+                rdata['refresh'] = rr.refresh
+                rdata['retry'] = rr.retry
+                rdata['expire'] = rr.expire
+                rdata['minimum'] = rr.minimum
+            elif rr.type == dpkt.dns.DNS_TXT:
+                rdata['text'] = b''.join(rr.text).decode('utf-8', errors='replace')
+            else:
+                # For other record types, store raw data as hex
+                rdata['data'] = rr.rdata.hex()
+            
+            return {
+                'name': name,
+                'type': rr_type,
+                'class': rr.cls,
+                'ttl': ttl,
+                'rdata': rdata
+            }
+        except Exception as e:
+            return {
+                'name': '',
+                'type': 'UNKNOWN',
+                'class': 0,
+                'ttl': 0,
+                'rdata': {'error': str(e)},
+                'parse_error': True
+            }
+            self.stats['queries'] += 1
+
     
     def _get_qtype_name(self, qtype: int) -> str:
-        """Get DNS query type name"""
         qtype_names = {
-            1: 'A', 2: 'NS', 5: 'CNAME', 6: 'SOA', 12: 'PTR',
-            15: 'MX', 16: 'TXT', 28: 'AAAA', 33: 'SRV', 255: 'ANY'
+            1: 'A', 2: 'NS', 5: 'CNAME', 6: 'SOA', 12: 'PTR', 15: 'MX', 16: 'TXT', 28: 'AAAA', 33: 'SRV', 255: 'ANY'
         }
         return qtype_names.get(qtype, f'TYPE{qtype}')
     
     def _get_rcode_name(self, rcode: int) -> str:
-        """Get DNS response code name"""
         rcode_names = {
             0: 'NOERROR', 1: 'FORMERR', 2: 'SERVFAIL', 3: 'NXDOMAIN',
             4: 'NOTIMP', 5: 'REFUSED', 9: 'NOTAUTH', 10: 'NOTZONE'
         }
         return rcode_names.get(rcode, f'RCODE{rcode}')
     
-    def _parse_rr(self, rr) -> Dict[str, Any]:
-        """Parse DNS resource record"""
-        try:
-            return {
-                'name': rr.name.decode('utf-8', errors='ignore'),
-                'type': self._get_qtype_name(rr.type),
-                'class': rr.cls,
-                'ttl': rr.ttl,
-                'data': self._format_rdata(rr.type, rr.rdata)
-            }
-        except Exception:
-            return {
-                'name': 'PARSE_ERROR',
-                'type': 'UNKNOWN',
-                'class': 0,
-                'ttl': 0,
-                'data': 'PARSE_ERROR'
-            }
+
     
     def _format_rdata(self, rtype: int, rdata: bytes) -> str:
-        """Format DNS resource record data"""
         try:
-            if rtype == 1:  # A
-                return self._ip_to_str(rdata)
-            elif rtype == 28:  # AAAA
-                return ':'.join(f'{rdata[i:i+2].hex()}' for i in range(0, 16, 2))
-            elif rtype in [2, 5, 12]:  # NS, CNAME, PTR
+            if rtype in (1, 28):  # A, AAAA
+                return '.'.join(str(b) for b in rdata)
+            elif rtype in (5, 2):  # CNAME, NS
+                return rdata.decode('utf-8', errors='ignore')
+            elif rtype == 16:  # TXT
                 return rdata.decode('utf-8', errors='ignore')
             else:
                 return rdata.hex()
         except Exception:
-            return 'FORMAT_ERROR'
+            return 'PARSE_ERROR'
     
     def get_stats(self) -> Dict[str, Any]:
-        """Get current statistics"""
-        stats = self.stats.copy()
-        stats['clients'] = list(stats['clients'])
-        stats['servers'] = list(stats['servers'])
-        return stats
+        return self.stats
     
     def reset_stats(self) -> None:
-        """Reset statistics"""
         self.stats = {
             'total_packets': 0,
             'dns_packets': 0,
@@ -206,25 +322,29 @@ class DNSPacketAnalyzer:
             'clients': set(),
             'servers': set(),
         }
-
+    
 
 class TrafficMonitor:
-    """DNS Traffic Monitor with dual-process architecture"""
+    """DNS Traffic Monitor using pcapy"""
     
     def __init__(self, config: TrafficConfig):
         self.config = config
         self.logger = get_logger(__name__)
-        self.analyzer = DNSPacketAnalyzer()
         self.running = False
+        
+        # Threads
         self.capture_thread = None
         self.analysis_thread = None
         self.stats_thread = None
         
-        # Packet queue for communication between capture and analysis
-        self.packet_queue = []
+        # Packet queue
+        self.packet_queue: List[Tuple[float, bytes]] = []
         self.queue_lock = threading.Lock()
         
-        # PCAP writer
+        # Analyzer
+        self.analyzer = DNSPacketAnalyzer()
+        
+        # PCAP file handling
         self.pcap_writer = None
         self.current_pcap_file = None
         self.pcap_start_time = None
@@ -272,7 +392,10 @@ class TrafficMonitor:
         
         # Close PCAP writer
         if self.pcap_writer:
-            self.pcap_writer.close()
+            try:
+                self.pcap_writer.close()
+            except Exception:
+                pass
             self.pcap_writer = None
         
         # Wait for threads to finish
@@ -316,11 +439,20 @@ class TrafficMonitor:
                     if header is None:
                         continue
                     
-                    timestamp = header.getts()[0] + header.getts()[1] / 1000000.0
+                    # header.getts() may not exist in mock; emulate timestamp
+                    try:
+                        ts = header.getts()
+                        timestamp = ts[0] + ts[1] / 1000000.0
+                    except Exception:
+                        timestamp = time.time()
+                        ts = (int(timestamp), int((timestamp - int(timestamp)) * 1000000))
                     
                     # Write to PCAP file
                     if self.pcap_writer:
-                        self.pcap_writer.writepkt(packet_data, header.getts())
+                        try:
+                            self.pcap_writer.writepkt(packet_data, ts)
+                        except Exception:
+                            pass
                     
                     # Add to analysis queue
                     with self.queue_lock:
@@ -341,7 +473,10 @@ class TrafficMonitor:
             self.logger.error(f"Capture worker failed: {e}")
         finally:
             if self.pcap_writer:
-                self.pcap_writer.close()
+                try:
+                    self.pcap_writer.close()
+                except Exception:
+                    pass
     
     def _analysis_worker(self) -> None:
         """Packet analysis worker thread"""
@@ -358,9 +493,9 @@ class TrafficMonitor:
                 
                 # Process packets
                 for timestamp, packet_data in packets_to_process:
-                    packet_info = self.analyzer.analyze_packet(timestamp, packet_data)
-                    if packet_info:
-                        self._handle_dns_packet(packet_info)
+                    packet = self.analyzer.analyze_packet(timestamp, packet_data)
+                    if packet:
+                        self._handle_dns_packet(packet)
                 
                 # Sleep if no packets to process
                 if not packets_to_process:
@@ -390,25 +525,29 @@ class TrafficMonitor:
                 if self.running:
                     self.logger.debug(f"Stats worker error: {e}")
     
-    def _handle_dns_packet(self, packet_info: Dict[str, Any]) -> None:
+    def _handle_dns_packet(self, packet: Packet) -> None:
         """Handle analyzed DNS packet"""
         # Log interesting packets
-        if packet_info['is_query']:
-            questions = ', '.join([f"{q['name']} {q['type']}" for q in packet_info['questions']])
-            self.logger.debug(f"DNS Query: {packet_info['src_ip']} -> {packet_info['dst_ip']}: {questions}")
+        if not packet.is_response:
+            questions = ', '.join([f"{q['name']} {q['type']}" for q in packet.questions])
+            self.logger.debug(f"DNS Query: {packet.src_ip} -> {packet.dst_ip}: {questions}")
         else:
-            rcode = self._get_rcode_name(packet_info['rcode'])
-            self.logger.debug(f"DNS Response: {packet_info['src_ip']} -> {packet_info['dst_ip']}: {rcode}")
+            rcode = self._get_rcode_name(packet.rcode)
+            self.logger.debug(f"DNS Response: {packet.src_ip} -> {packet.dst_ip}: {rcode}")
     
     def _rotate_pcap_file(self) -> None:
         """Rotate PCAP file"""
         if self.pcap_writer:
-            self.pcap_writer.close()
+            try:
+                self.pcap_writer.close()
+            except Exception:
+                pass
         
         timestamp = get_timestamp()
         self.current_pcap_file = os.path.join(self.config.pcap_dir, f"dns_traffic_{timestamp}.pcap")
         
         try:
+            # In real pcapy, dump_open(file) returns a Dumper; mock will offer compatible stub
             self.pcap_writer = pcapy.dump_open(self.current_pcap_file)
             self.pcap_start_time = time.time()
             self.logger.info(f"Started new PCAP file: {self.current_pcap_file}")
