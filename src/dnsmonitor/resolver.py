@@ -14,9 +14,9 @@ except ImportError:
 import dpkt
 from dpkt.dns import DNS
 
-from config import ResolverConfig
-from utils.logger import get_logger
-from utils import Colors, colorize
+from .config import ResolverConfig
+from .utils.logger import get_logger
+from .utils import Colors, colorize
 
 
 class DNSTransaction:

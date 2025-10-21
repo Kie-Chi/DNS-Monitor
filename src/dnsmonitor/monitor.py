@@ -9,7 +9,7 @@ from typing import Optional, Dict, Any
 from datetime import datetime
 
 from .config import MonitorConfig
-from .traffic import TrafficMonitor
+from .traffic import OptimizedTrafficMonitor as TrafficMonitor
 from .resolver import ResolverMonitor
 from .cache import CacheMonitor
 from .utils.logger import setup_logger, get_logger, log_system_info, PerformanceLogger

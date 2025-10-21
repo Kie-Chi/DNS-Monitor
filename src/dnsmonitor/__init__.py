@@ -10,10 +10,10 @@ This package provides monitoring capabilities for:
 __version__ = "0.1.0"
 __author__ = "DNS Monitor Team"
 
-from monitor import DNSMonitor
-from traffic import TrafficMonitor
-from resolver import ResolverMonitor
-from cache import CacheMonitor
+from .monitor import DNSMonitor
+from .traffic import OptimizedTrafficMonitor as TrafficMonitor
+from .resolver import ResolverMonitor
+from .cache import CacheMonitor
 
 __all__ = [
     "DNSMonitor",

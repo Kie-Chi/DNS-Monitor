@@ -13,13 +13,53 @@ from .constants import DEFAULT_CACHE_INTERVAL, DEFAULT_ANALYSIS_PORT
 
 @dataclass
 class TrafficConfig:
-    """Traffic monitoring configuration"""
-    interface: str = "any"
-    pcap_dir: str = "/tmp/dnsmonitor/pcap"
+    """DNS Traffic Monitoring Configuration"""
+    interface: str = "eth0"
+    pcap_dir: str = "./pcap"
     pcap_rotation_size: int = 100  # MB
-    pcap_rotation_time: int = 300  # seconds
+    pcap_rotation_time: int = 3600  # seconds
     bpf_filter: str = "port 53"
     buffer_size: int = 65536
+    
+    # optimization
+    enable_lazy_loading: bool = True
+    enable_object_pool: bool = False
+    max_packet_cache: int = 1000
+    
+    # performance tuning
+    capture_timeout_ms: int = 100
+    enable_promiscuous: bool = True
+    
+    @classmethod
+    def for_pcap_only(cls, interface: str, pcap_dir: str = "./pcap", **kwargs) -> 'TrafficConfig':
+        """Create PCAP-only configuration"""
+        return cls(
+            interface=interface,
+            pcap_dir=pcap_dir,
+            enable_lazy_loading=False,
+            **kwargs
+        )
+    
+    @classmethod
+    def for_display_only(cls, interface: str, **kwargs) -> 'TrafficConfig':
+        """Create display-only configuration""" 
+        return cls(
+            interface=interface,
+            pcap_dir="",
+            enable_lazy_loading=True,
+            **kwargs
+        )
+    
+    @classmethod
+    def for_resolver(cls, interface: str, **kwargs) -> 'TrafficConfig':
+        """Create resolver-specific configuration"""
+        return cls(
+            interface=interface,
+            pcap_dir="",
+            enable_lazy_loading=True,
+            max_packet_cache=5000,
+            **kwargs
+        )
 
 
 @dataclass
