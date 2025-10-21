@@ -20,6 +20,8 @@ class TrafficConfig:
     pcap_rotation_time: int = 3600  # seconds
     bpf_filter: str = "port 53"
     buffer_size: int = 65536
+    snaplen: int = 65535
+    dns_port: int = 53
     
     # optimization
     enable_lazy_loading: bool = True

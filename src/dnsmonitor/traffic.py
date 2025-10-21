@@ -132,7 +132,7 @@ class OptimizedTrafficMonitor:
         
         # Shutdown worker thread pool
         if self.worker_executor:
-            self.worker_executor.shutdown(wait=True, timeout=10)
+            self.worker_executor.shutdown(wait=True)
             self.worker_executor = None
         
         # Close pcap resources
@@ -177,8 +177,8 @@ class OptimizedTrafficMonitor:
             self.pcap_handle = pcapy.open_live(
                 self.config.interface,
                 self.config.snaplen,
-                1,  # promiscuous mode
-                self.config.timeout
+                self.config.enable_promiscuous,  # promiscuous mode
+                self.config.capture_timeout_ms
             )
             
             # filter dns traffic
