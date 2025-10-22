@@ -154,7 +154,7 @@ class ResolverMonitor:
         
         self._validate_config()
         
-        traffic_config = TrafficConfig(interface="any")
+        traffic_config = TrafficConfig(interface=self.config.interface)
         default_filter = (f"(host {self.config.client_ip} or host {self.config.resolver_ip}) and port 53")
         traffic_config.bpf_filter = default_filter
         self.logger.info(f"Using default BPF filter: {default_filter}")

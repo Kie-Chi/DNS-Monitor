@@ -88,3 +88,21 @@ def validate_ip(ip: str) -> bool:
 def validate_port(port: int) -> bool:
     """Validate port number"""
     return 1 <= port <= 65535
+
+
+# Import network utilities
+from .network import get_iface, validate_cidr
+
+__all__ = [
+    'ensure_directory',
+    'get_timestamp',
+    'get_file_size',
+    'rotate_file',
+    'format_bytes',
+    'save_json',
+    'load_json',
+    'validate_ip',
+    'validate_port',
+    'get_iface',
+    'validate_cidr'
+]

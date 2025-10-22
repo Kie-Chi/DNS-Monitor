@@ -67,6 +67,7 @@ class TrafficConfig:
 @dataclass
 class ResolverConfig:
     """Resolver path monitoring configuration"""
+    interface: str = "any"
     client_ip: Optional[str] = None
     resolver_ip: Optional[str] = None
     timeout: int = 3

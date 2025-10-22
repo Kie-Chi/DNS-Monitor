@@ -6,6 +6,7 @@ import click
 import sys
 from typing import Optional
 
+from .utils.common import get_iface
 from .config import ConfigManager
 from .monitor import DNSMonitor
 from .traffic import OptimizedTrafficMonitor, MonitorMode
@@ -90,6 +91,7 @@ def monitor(ctx, interface: Optional[str], client_ip: Optional[str], resolver_ip
 
 
 @cli.command()
+@click.option("--cidr", "-c", help="CIDR range to monitor")
 @click.option('--interface', '-i', help='Network interface to monitor')
 @click.option('--output-dir', '-o', help='Output directory for PCAP files')
 @click.option('--rotation-size', '-rz', type=int, help='PCAP rotation size in MB')
@@ -101,11 +103,15 @@ def monitor(ctx, interface: Optional[str], client_ip: Optional[str], resolver_ip
     help='Monitoring mode'
 )
 @click.pass_context
-def traffic(ctx, interface: Optional[str], output_dir: Optional[str], rotation_size: Optional[int], rotation_time: Optional[int], bpf_filter: Optional[str], mode: Optional[str]):
+def traffic(ctx, cidr: Optional[str], interface: Optional[str], output_dir: Optional[str], rotation_size: Optional[int], rotation_time: Optional[int], bpf_filter: Optional[str], mode: Optional[str]):
     """Monitor DNS traffic only"""
     config = ctx.obj['config']
     logger = ctx.obj['logger']
-    
+    if cidr:
+        config.traffic.interface = get_iface(cidr)
+        if not config.traffic.interface:
+            print_error(f"Failed to find interface for CIDR {cidr}")
+            sys.exit(1)
     # Override config with command line options
     if interface:
         config.traffic.interface = interface
@@ -140,6 +146,7 @@ def traffic(ctx, interface: Optional[str], output_dir: Optional[str], rotation_s
 
 
 @cli.command()
+@click.option("--cidr", "-cr", help="CIDR range to monitor")
 @click.option('--client-ip', '-c', required=True, help='Client IP address')
 @click.option('--resolver-ip', '-r', required=True, help='Resolver IP address')
 @click.option('--output', '-o', help='Output file path')
@@ -147,7 +154,7 @@ def traffic(ctx, interface: Optional[str], output_dir: Optional[str], rotation_s
 @click.option('--analysis-port', '-p', type=int, help='Analysis server port')
 @click.option('--timeout', '-t', type=int, help='Query timeout in seconds')
 @click.pass_context
-def resolv(ctx, client_ip: str, resolver_ip: str, output: Optional[str], enable_server: bool, analysis_port: Optional[int], timeout: Optional[int]):  
+def resolv(ctx, cidr: Optional[str], client_ip: str, resolver_ip: str, output: Optional[str], enable_server: bool, analysis_port: Optional[int], timeout: Optional[int]):  
     """Monitor DNS resolution path"""
     config = ctx.obj['config']
     logger = ctx.obj['logger']
@@ -162,6 +169,11 @@ def resolv(ctx, client_ip: str, resolver_ip: str, output: Optional[str], enable_
         config.resolver.enable_server = enable_server
         if analysis_port:
             config.resolver.analysis_port = analysis_port
+    if cidr:
+        config.resolver.interface = get_iface(cidr)
+        if not config.resolver.interface:
+            print_error(f"Failed to find interface for CIDR {cidr}")
+            sys.exit(1)
     
     print_header("DNS Resolver Monitor Starting")
     print_info(f"Client IP: {config.resolver.client_ip}")
