@@ -15,9 +15,6 @@ import socketserver
 from typing import List, Optional, Dict, Any
 from dataclasses import asdict
 from pathlib import Path
-
-from git import exc
-
 from .traffic import create_resolver_monitor
 from .packet import DNSPacket, RCODE_MAP
 from .config import ResolverConfig, TrafficConfig
@@ -208,8 +205,6 @@ class ResolverMonitor:
             
         except Exception as e:
             self.logger.error(f"Failed to start resolver monitoring: {e}")
-        finally:
-            self.stop()
 
     def stop(self):
         """Stops all threads and saves results."""
