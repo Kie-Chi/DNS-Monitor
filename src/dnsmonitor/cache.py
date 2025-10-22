@@ -130,17 +130,17 @@ class CacheDiff:
             old_rec = old_map[key]
             new_rec = new_map[key]
             # If TTL has decreased, it's a modification
-            if new_rec.ttl < old_rec.ttl:
+            if new_rec.ttl > old_rec.ttl:
                 self.modified_records.append({
                     'old': old_rec.to_dict(),
                     'new': new_rec.to_dict(),
                 })
-                added_pkts.append(new_rec.trigger)
-                removed_pkts.append(old_rec.trigger)
+                added_pkts.append(new_rec)
+                removed_pkts.append(old_rec)
         if added_pkts:
-            self.added_records = [rec for rec in self.added_records if rec.trigger not in added_pkts]
+            self.added_records = [rec for rec in self.added_records if rec not in added_pkts]
         if removed_pkts:
-            self.removed_records = [rec for rec in self.removed_records if rec.trigger not in removed_pkts]
+            self.removed_records = [rec for rec in self.removed_records if rec not in removed_pkts]
 
     def has_changes(self) -> bool:
         return bool(self.added_records or self.removed_records or self.modified_records)
@@ -198,11 +198,11 @@ class BindCacheMonitor(AbstractCacheMonitor):
             self.logger.error(f"Failed to dump BIND cache: {e}")
             return ""
 
-    def parse_cache(self, cache_data: str, trigger_packet: Optional[DNSPacket]) -> CacheSnapshot:
+    def parse_cache(self, cache_data: str, trigger: Optional[DNSPacket]) -> CacheSnapshot:
         """
         Parse BIND cache dump content into a CacheSnapshot.
         """
-        snapshot = CacheSnapshot(trigger_packet=trigger_packet)
+        snapshot = CacheSnapshot(trigger=trigger)
         self.logger.debug("Starting expert parse of BIND cache dump.")
         
         in_target_view = False
@@ -292,7 +292,7 @@ class BindCacheMonitor(AbstractCacheMonitor):
                     rtype=rdatatype.to_text(rdtype_obj),
                     rdata=value_str,
                     ttl=ttl,
-                    is_negative=is_negative
+                    is_neg=is_negative
                 )
                 snapshot.add_record(record)
             
@@ -300,7 +300,7 @@ class BindCacheMonitor(AbstractCacheMonitor):
                 self.logger.debug(f"Skipping line block due to parsing error. Line: '{line}'. Error: {e}")
                 continue
         
-        self.logger.info(f"Parsed {snapshot.get_record_count()} records from BIND cache.")
+        self.logger.info(f"Parsed {snapshot.record_cnts()} records from BIND cache.")
         return snapshot
 
 class UnboundCacheMonitor(AbstractCacheMonitor):
@@ -520,16 +520,16 @@ class CacheMonitor:
         last_dump_time = 0.0
         while self.running.is_set():
             try:
-                trigger_packet = self.trigger_queue.get(timeout=1.0)
-                if trigger_packet is None: 
+                trigger = self.trigger_queue.get(timeout=1.0)
+                if trigger is None: 
                     break
 
                 if time.time() - last_dump_time < self.config.common.cooldown_period:
                     continue
 
-                self.logger.info(f"Transaction for '{trigger_packet.qname}' completed. Triggering cache dump.")
+                self.logger.info(f"Transaction for '{trigger.qname}' completed. Triggering cache dump.")
                 
-                new_snapshot = self._take_snapshot(trigger_packet)
+                new_snapshot = self._take_snapshot(trigger)
                 last_dump_time = time.time()
                 
                 with self.lock:
