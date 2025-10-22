@@ -15,7 +15,7 @@ from .constants import DEFAULT_CACHE_INTERVAL, DEFAULT_ANALYSIS_PORT, DEFAULT_RE
 class TrafficConfig:
     """DNS Traffic Monitoring Configuration"""
     interface: str = "any"
-    pcap_dir: str = "./pcap"
+    pcap_dir: str = "pcap"
     pcap_rotation_size: int = 100  # MB
     pcap_rotation_time: int = 3600  # seconds
     bpf_filter: str = "port 53"
@@ -85,10 +85,15 @@ class ResolverConfig:
 @dataclass
 class CacheCommonConfig:
     """Common fields for cache monitoring"""
-    interval: int = DEFAULT_CACHE_INTERVAL
+    interface: str = "any"
+    resolver_ip: Optional[str] = None
+    cooldown_period: float = .5
+    timeout: float = 2.0
     enable_analysis_server: bool = False
+    analysis_address: str = "0.0.0.0"
     analysis_port: int = DEFAULT_ANALYSIS_PORT
-    save_changes: bool = False
+    save_changes: bool = True
+    output_path: str = "cache"
 
 
 @dataclass
@@ -212,8 +217,12 @@ class ConfigManager:
             self.config.cache.server_type = os.getenv("DNS_SOFTWARE")
         
         # Cache config - common fields
-        if os.getenv("CACHE_INTERVAL"):
-            self.config.cache.common.interval = int(os.getenv("CACHE_INTERVAL"))
+        if os.getenv("CACHE_INTERFACE"):
+            self.config.cache.common.interface = os.getenv("CACHE_INTERFACE")
+        if os.getenv("CACHE_RESOLVER_IP"):
+            self.config.cache.common.resolver_ip = os.getenv("CACHE_RESOLVER_IP")
+        if os.getenv("CACHE_COOLDOWN_PERIOD"):
+            self.config.cache.common.cooldown_period = float(os.getenv("CACHE_COOLDOWN_PERIOD"))
         if os.getenv("ENABLE_ANALYSIS_SERVER"):
             self.config.cache.common.enable_analysis_server = os.getenv("ENABLE_ANALYSIS_SERVER").lower() in ('true', 'yes', '1')
         if os.getenv("ANALYSIS_PORT"):

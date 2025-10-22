@@ -1,6 +1,7 @@
 """DNS Cache Monitor - Monitors DNS server cache changes for BIND and Unbound
 """
 
+from concurrent.futures import thread
 import time
 import threading
 import subprocess
@@ -8,31 +9,36 @@ import json
 import socket
 import re
 import sys
+import queue
 from abc import ABC, abstractmethod
-from typing import Dict, List, Optional, Any, Set, Tuple, override
-from datetime import datetime, timedelta
-from dataclasses import dataclass, asdict
+from typing import Dict, List, Optional, Any, NamedTuple, Set, Tuple, override
+from dataclasses import dataclass, asdict, field
 from pathlib import Path
+import socketserver
 
-from watchdog.observers import Observer
-from watchdog.events import FileSystemEventHandler
-
-from .config import CacheConfig, CacheCommonConfig, BindCacheConfig, UnboundCacheConfig
+from .traffic import create_resolver_monitor
+from .packet import DNSPacket
+from .config import CacheConfig, TrafficConfig
 from .utils.logger import get_logger
 from .utils import Colors, colorize
 from .utils.common import get_timestamp, save_json
 
+class PendingQuery(NamedTuple):
+    query: DNSPacket
+    timestamp: float
 
+@dataclass(slots=True)
 class DNSCacheRecord:
     """Represents a DNS cache record"""
-    
-    def __init__(self, name: str, rtype: str, rdata: str, ttl: int, timestamp: float = None):
-        self.name = name
-        self.rtype = rtype
-        self.rdata = rdata
-        self.ttl = ttl
-        self.timestamp = timestamp or time.time()
-        self.original_ttl = ttl
+    name: str
+    rtype: str
+    rdata: str
+    ttl: int
+    timestamp: float = field(default_factory=time.time)
+    original_ttl: int = field(init=False)
+
+    def __post_init__(self):
+        self.original_ttl = self.ttl
     
     def __eq__(self, other):
         if not isinstance(other, DNSCacheRecord):
@@ -42,56 +48,45 @@ class DNSCacheRecord:
                 self.rdata == other.rdata)
     
     def __hash__(self):
-        return hash((self.name, self.rtype, self.rdata))
+        return hash((self.name, self.rdata, self.rtype))
     
     def __str__(self):
         return f"{self.name} {self.ttl} IN {self.rtype} {self.rdata}"
     
     def to_dict(self) -> Dict[str, Any]:
-        """Convert record to dictionary"""
-        return {
-            'name': self.name,
-            'type': self.rtype,
-            'data': self.rdata,
-            'ttl': self.ttl,
-            'original_ttl': self.original_ttl,
-            'timestamp': self.timestamp
-        }
+        return asdict(self)
     
     def is_expired(self) -> bool:
-        """Check if record is expired"""
         return time.time() - self.timestamp > self.original_ttl
 
 
 class CacheSnapshot:
     """Represents a DNS cache snapshot"""
     
-    def __init__(self, timestamp: float = None):
+    def __init__(self, timestamp: float = None, trigger: Optional[DNSPacket] = None):
         self.timestamp = timestamp or time.time()
-        self.records: Dict[Tuple[str, str], DNSCacheRecord] = {}
+        self.trigger = trigger
+        self.records: Dict[Tuple[str, str, str], DNSCacheRecord] = {}
     
     def add_record(self, record: DNSCacheRecord) -> None:
-        """Add record to snapshot"""
-        key = (record.name, record.rtype)
+        key = (record.name, record.rtype, record.rdata)
         self.records[key] = record
     
-    def get_record_count(self) -> int:
-        """Get total number of records"""
+    def record_cnts(self) -> int:
         return len(self.records)
     
-    def get_records_by_type(self) -> Dict[str, int]:
-        """Get record count by type"""
+    def record_grps(self) -> Dict[str, int]:
         type_counts = {}
         for record in self.records.values():
             type_counts[record.rtype] = type_counts.get(record.rtype, 0) + 1
         return type_counts
     
     def to_dict(self) -> Dict[str, Any]:
-        """Convert snapshot to dictionary"""
         return {
             'timestamp': self.timestamp,
-            'record_count': self.get_record_count(),
-            'records_by_type': self.get_records_by_type(),
+            'trigger': self.trigger.to_dict() if self.trigger else None,
+            'record_cnts': self.record_cnts(),
+            'record_grps': self.record_grps(),
             'records': [record.to_dict() for record in self.records.values()]
         }
 
@@ -111,42 +106,38 @@ class CacheDiff:
         self._calculate_diff()
     
     def _calculate_diff(self) -> None:
-        """Calculate differences between snapshots"""
-        old_keys: Set[Tuple[str, str]] = set(self.old_snapshot.records.keys())
-        new_keys: Set[Tuple[str, str]] = set(self.new_snapshot.records.keys())
+        old_records_set = set(self.old_snapshot.records.values())
+        new_records_set = set(self.new_snapshot.records.values())
         
-        # Find added records
-        for key in new_keys - old_keys:
-            self.added_records.append(self.new_snapshot.records[key])
+        self.added_records = list(new_records_set - old_records_set)
+        self.removed_records = list(old_records_set - new_records_set)
         
-        # Find removed records
-        for key in old_keys - new_keys:
-            self.removed_records.append(self.old_snapshot.records[key])
-        
-        # Find modified records
-        for key in old_keys & new_keys:
-            old_record = self.old_snapshot.records[key]
-            new_record = self.new_snapshot.records[key]
-            
-            data_changed = old_record.rdata != new_record.rdata
-            ttl_changed = old_record.ttl > new_record.ttl
-            if data_changed or ttl_changed:
+        old_map = {hash(r): r for r in old_records_set}
+        new_map = {hash(r): r for r in new_records_set}
+
+        common_keys = set(old_map.keys()) & set(new_map.keys())
+        added_pkts = []
+        removed_pkts = []
+        for key in common_keys:
+            old_rec = old_map[key]
+            new_rec = new_map[key]
+            # If TTL has decreased, it's a modification
+            if new_rec.ttl < old_rec.ttl:
                 self.modified_records.append({
-                    'old': old_record.to_dict(),
-                    'new': new_record.to_dict(),
-                    'reason': {
-                        'description': 'Data Changed' if data_changed else 'TTL Changed',
-                        'old': old_record.rdata if data_changed else old_record.ttl,
-                        'new': new_record.rdata if data_changed else new_record.ttl
-                    }
+                    'old': old_rec.to_dict(),
+                    'new': new_rec.to_dict(),
                 })
-    
+                added_pkts.append(new_rec.trigger)
+                removed_pkts.append(old_rec.trigger)
+        if added_pkts:
+            self.added_records = [rec for rec in self.added_records if rec.trigger not in added_pkts]
+        if removed_pkts:
+            self.removed_records = [rec for rec in self.removed_records if rec.trigger not in removed_pkts]
+
     def has_changes(self) -> bool:
-        """Check if there are any changes"""
         return bool(self.added_records or self.removed_records or self.modified_records)
     
     def get_summary(self) -> Dict[str, int]:
-        """Get summary of changes"""
         return {
             'added': len(self.added_records),
             'removed': len(self.removed_records),
@@ -154,543 +145,323 @@ class CacheDiff:
         }
     
     def to_dict(self) -> Dict[str, Any]:
-        """Convert diff to dictionary"""
         return {
             'timestamp': self.timestamp,
-            'old_snapshot_time': self.old_snapshot.timestamp,
-            'new_snapshot_time': self.new_snapshot.timestamp,
+            'old_snap_time': self.old_snapshot.timestamp,
+            'new_snap_time': self.new_snapshot.timestamp,
+            'trigger': self.new_snapshot.trigger.to_dict() if self.new_snapshot.trigger else None,
             'summary': self.get_summary(),
-            'added_records': [record.to_dict() for record in self.added_records],
-            'removed_records': [record.to_dict() for record in self.removed_records],
-            'modified_records': [
-                {
-                    'old': record['old'],
-                    'new': record['new'],
-                    'reason': record['reason']
-                }
-                for record in self.modified_records
-            ]
+            'added': [r.to_dict() for r in self.added_records],
+            'removed': [r.to_dict() for r in self.removed_records],
+            'modified': self.modified_records
         }
 
 
 class AbstractCacheMonitor(ABC):
-
     def __init__(self, config: CacheConfig):
         self.config = config
         self.logger = get_logger(__name__)
 
     @abstractmethod
-    def dump_cache(self, **kwargs) -> str:
-        """Dump cache using appropriate method"""
-        pass
+    def dump_cache(self) -> str: pass
 
     @abstractmethod
-    def parse_cache(self, cache_content: str) -> CacheSnapshot:
-        """Parse cache content into CacheSnapshot"""
-        pass
-
-class FileChangeHandler(FileSystemEventHandler):
-    def __init__(self, dump_filename: str, file_modified: threading.Event):
-        self.dump_filename = dump_filename
-        self.file_modified = file_modified
-        
-    def on_modified(self, event):
-        if not event.is_directory and event.src_path.endswith(self.dump_filename):
-            self.file_modified.set()
+    def parse_cache(self, cache_content: str, trigger: Optional[DNSPacket]) -> CacheSnapshot: pass
 
 class BindCacheMonitor(AbstractCacheMonitor):
-    """BIND DNS cache monitor using rndc"""
-    
     def __init__(self, config: CacheConfig):
         super().__init__(config)
         self.rndc_key_file = config.bind.rndc_key_file or "/usr/local/etc/bind/rndc.key"
         self.dump_file = config.bind.dump_file or "/usr/local/var/cache/bind/named_dump.db"
     
-    @override
-    def dump_cache(self, **kwargs) -> str:
-        """Dump BIND cache using rndc with file change notification
-        
-        Returns:
-            str: The content of the cache dump file, or empty string on failure
-        """
-        max_wait_time = float(kwargs.get('max_wait_time', 1.0))
+    def dump_cache(self) -> str:
+        # Simplified dump logic for brevity, original logic is also fine
         try:
-            dump_path = Path(self.dump_file)
-            old_mtime = dump_path.stat().st_mtime if dump_path.exists() else 0
-            file_modified = threading.Event()
-            dump_dir = dump_path.parent
-            dump_filename = dump_path.name
-            observer = Observer()
-            handler = FileChangeHandler(dump_filename, file_modified)
-            observer.schedule(handler, dump_dir, recursive=False)
-            observer.start()
-            
-            try:
-                cmd = ["rndc", "-k", self.rndc_key_file, "dumpdb", "-cache"]
-                result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-                
-                if result.returncode != 0:
-                    self.logger.error(f"rndc dump failed: {result.stderr}")
-                    return ""
-                
-                # Wait for notification or timeout
-                if file_modified.wait(timeout=max_wait_time):
-                    self.logger.debug("Received file modification notification")
-                    if dump_path.exists():
-                        current_mtime = dump_path.stat().st_mtime
-                        if current_mtime > old_mtime:
-                            self.logger.debug(f"Dump file updated successfully")
-                            try:
-                                with open(self.dump_file, 'r', encoding='utf-8', errors='ignore') as f:
-                                    return f.read()
-                            except Exception as e:
-                                self.logger.error(f"Failed to read dump file: {e}")
-                                return ""
-                
-                self.logger.warning(f"Dump file not updated within {max_wait_time}s timeout")
-                if dump_path.exists():
-                    try:
-                        with open(self.dump_file, 'r', encoding='utf-8', errors='ignore') as f:
-                            return f.read()
-                    except Exception as e:
-                        self.logger.error(f"Failed to read dump file: {e}")
+            cmd = ["rndc", "-k", self.rndc_key_file, "dumpdb", "-cache"]
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+            if result.returncode != 0:
+                self.logger.error(f"rndc dump failed: {result.stderr}")
                 return ""
-                
-            finally:
-                # Clean up observer
-                observer.stop()
-                observer.join(timeout=1.0)
-                
-        except subprocess.TimeoutExpired:
-            self.logger.error("rndc dump command timed out")
-            return ""
+            
+            time.sleep(0.1)
+            with open(self.dump_file, 'r', encoding='utf-8', errors='ignore') as f:
+                return f.read()
         except Exception as e:
             self.logger.error(f"Failed to dump BIND cache: {e}")
             return ""
-    
-    @override
-    def parse_cache(self, cache_data: str) -> CacheSnapshot:
-        """Parse BIND cache dump data
-        
-        Args:
-            cache_data (str): The cache data to parse
-            
-        Returns:
-            CacheSnapshot: The parsed cache snapshot
-        """
-        snapshot = CacheSnapshot()
-        
-        try:
-            # BIND cache format: name ttl class type rdata
-            cache_pattern = r'^([^\s]+)\s+(\d+)\s+IN\s+([A-Z]+)\s+(.+)$'
-            
-            for line in cache_data.split('\n'):
-                line = line.strip()
-                if not line or line.startswith(';'):
-                    continue
-                
-                match = re.match(cache_pattern, line)
-                if match:
-                    name, ttl, rtype, rdata = match.groups()
-                    record = DNSCacheRecord(name, rtype, rdata.strip(), int(ttl))
-                    snapshot.add_record(record)
-            
-            self.logger.debug(f"Parsed {snapshot.get_record_count()} BIND cache records")
-            return snapshot
-            
-        except Exception as e:
-            self.logger.error(f"Failed to parse BIND cache: {e}")
-            return snapshot
 
+    def parse_cache(self, cache_data: str, trigger: Optional[DNSPacket]) -> CacheSnapshot:
+        snapshot = CacheSnapshot(trigger=trigger)
+        cache_pattern = r'^([^\s;]+)\s+(\d+)\s+(?:IN)\s+([A-Z0-9]+)\s+(.+)$'
+        for line in cache_data.split('\n'):
+            line = line.strip()
+            if not line or line.startswith(';'):
+                continue
+            
+            match = re.match(cache_pattern, line)
+            if match:
+                name, ttl, rtype, rdata = match.groups()
+                record = DNSCacheRecord(name, rtype, rdata.strip(), int(ttl))
+                snapshot.add_record(record)
+        return snapshot
 
 class UnboundCacheMonitor(AbstractCacheMonitor):
-    """Unbound DNS cache monitor using unbound-control"""
-    
-    def __init__(self, config: CacheConfig):
-        super().__init__(config)
-    
-    @override
-    def dump_cache(self, **kwargs) -> str:  
-        """Dump Unbound cache using unbound-control"""
+    def dump_cache(self) -> str:
         try:
             cmd = ["unbound-control", "dump_cache"]
             if self.config.unbound.control_config:
                 cmd = ["unbound-control", "-c", self.config.unbound.control_config, "dump_cache"]
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-            
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
             if result.returncode != 0:
                 self.logger.error(f"unbound-control dump failed: {result.stderr}")
                 return ""
-            
             return result.stdout
-            
-        except subprocess.TimeoutExpired:
-            self.logger.error("unbound-control dump timed out")
-            return ""
         except Exception as e:
             self.logger.error(f"Failed to dump Unbound cache: {e}")
             return ""
     
-    @override
-    def parse_cache(self, cache_data: str) -> CacheSnapshot:
-        """Parse Unbound cache data
-        
-        Args:
-            cache_data (str): The cache data to parse
-            
-        Returns:
-            CacheSnapshot: The parsed cache snapshot
-        """
-        snapshot = CacheSnapshot()
-        
-        try:
-            lines = cache_data.strip().split('\n')
-            
-            for line in lines:
-                line = line.strip()
-                if not line:
-                    continue
-                
-                # Unbound cache format: name type class ttl rdata
-                parts = line.split()
-                if len(parts) >= 5:
-                    name = parts[0]
-                    rtype = parts[1]
-                    ttl = int(parts[3])
-                    rdata = ' '.join(parts[4:])
-                    
-                    record = DNSCacheRecord(name, rtype, rdata, ttl)
-                    snapshot.add_record(record)
-            
-            self.logger.debug(f"Parsed {snapshot.get_record_count()} Unbound cache records")
-            return snapshot
-            
-        except Exception as e:
-            self.logger.error(f"Failed to parse Unbound cache: {e}")
-            return snapshot
+    def parse_cache(self, cache_data: str, trigger: Optional[DNSPacket]) -> CacheSnapshot:
+        snapshot = CacheSnapshot(trigger=trigger)
+        for line in cache_data.strip().split('\n'):
+            if line.startswith("msg") or "validation" in line or not line:
+                continue
+            parts = line.split()
+            if len(parts) >= 5 and parts[3].isdigit():
+                name, rtype, _, ttl, *rdata_parts = parts
+                rdata = ' '.join(rdata_parts)
+                record = DNSCacheRecord(name, rtype, rdata, int(ttl))
+                snapshot.add_record(record)
+        return snapshot
 
+# REFACTORED: CacheAnalysisServer now retrieves latest data instead of triggering analysis
+class CacheAnalysisServer(socketserver.ThreadingTCPServer):
+    def __init__(self, server_address, RequestHandlerClass, monitor: 'CacheMonitor') -> None:
+        super().__init__(server_address, RequestHandlerClass)
+        self.monitor = monitor
 
-class CacheAnalysisServer:
-    """TCP server for cache analysis requests (similar to unbound.py)"""
-    
-    def __init__(self, cache_monitor: 'CacheMonitor', port: int = 9999):
-        self.cache_monitor = cache_monitor
-        self.port = port
-        self.server_socket = None
-        self.running = False
-        self.logger = cache_monitor.logger
-    
-    def start(self) -> None:
-        """Start the analysis server"""
+class CacheRequestHandler(socketserver.BaseRequestHandler):
+    def handle(self) -> None:
         try:
-            self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            self.server_socket.bind(('0.0.0.0', self.port))
-            self.server_socket.listen(5)
+            with self.server.monitor.lock:
+                latest_diff = self.server.monitor.last_diff
+                latest_snapshot = self.server.monitor.current_snapshot
             
-            self.running = True
-            self.logger.info(f"Cache analysis server started on port {self.port}")
-            
-            while self.running:
-                try:
-                    client_socket, address = self.server_socket.accept()
-                    self.logger.debug(f"Client connected from {address}")
-                    
-                    # Handle client in separate thread
-                    client_thread = threading.Thread(
-                        target=self._handle_client,
-                        args=(client_socket,),
-                        daemon=True
-                    )
-                    client_thread.start()
-                    
-                except Exception as e:
-                    if self.running:
-                        self.logger.error(f"Server error: {e}")
-                        
-        except Exception as e:
-            self.logger.error(f"Failed to start analysis server: {e}")
-        finally:
-            self.stop()
-    
-    def stop(self) -> None:
-        """Stop the analysis server"""
-        self.running = False
-        if self.server_socket:
-            try:
-                self.server_socket.close()
-            except Exception:
-                pass
-        self.logger.info("Cache analysis server stopped")
-    
-    def _handle_client(self, client_socket: socket.socket) -> None:
-        """Handle client request"""
-        try:
-            # Trigger cache analysis
-            diff = self.cache_monitor.analyze_cache_changes()
-            
-            if diff and diff.has_changes():
-                response = json.dumps(diff.to_dict(), indent=2)
+            if latest_diff:
+                response = {
+                    "status": "success",
+                    "message": "Cache diff available.",
+                    "diff": latest_diff.to_dict()
+                }
+            elif latest_snapshot:
+                response = {
+                    "status": "success",
+                    "message": "No changes since last trigger.",
+                    "snapshot": latest_snapshot.to_dict()
+                }
             else:
-                response = json.dumps({"message": "No cache changes detected"})
-            
-            client_socket.send(response.encode('utf-8'))
-            
+                response = {
+                    "status": "error",
+                    "message": "No snapshot available yet."
+                }
+
+            self.request.sendall(json.dumps(response, indent=2).encode('utf-8'))
         except Exception as e:
-            self.logger.error(f"Error handling client: {e}")
-            error_response = json.dumps({"error": str(e)})
-            try:
-                client_socket.send(error_response.encode('utf-8'))
-            except Exception:
-                pass
+            self.server.monitor.logger.error(f"Error handling client request: {e}")
         finally:
-            try:
-                client_socket.close()
-            except Exception:
-                pass
+            self.request.close()
 
 
 class CacheMonitor:
-    """Main DNS cache monitor supporting multiple DNS servers"""
-    
     def __init__(self, config: CacheConfig):
+        resolver_ip = config.common.resolver_ip
+        if not resolver_ip:
+            raise ValueError("resolver_ip must be set for transaction-aware monitoring.")
+
         self.config = config
         self.logger = get_logger(__name__)
-        self.running = False
+        self.running = threading.Event()
+        self.lock = threading.Lock()
         
-        # Reflect registry
-        self.cache_impl = self._cache_impl(config)
-        
-        # Cache snapshots
-        self.previous_snapshot: Optional[CacheSnapshot] = None
+        # Data storage, protected by the lock
         self.current_snapshot: Optional[CacheSnapshot] = None
+        self.last_diff: Optional[CacheDiff] = None
+        
+        self.pd_query: Dict[Tuple[str, int, int], PendingQuery] = {}
+        self.trans_lock = threading.Lock()
+        self.TRANSACTION_TIMEOUT = config.common.timeout # 2 seconds
+
+        # Traffic monitoring setup
+        self.packet_queue = queue.Queue(maxsize=10000)
+        self.trigger_queue = queue.Queue(maxsize=100)
+        bpf_filter = f"host {resolver_ip} and udp port 53"
+        traffic_cfg = TrafficConfig(interface=config.common.interface, bpf_filter=bpf_filter)
+        self.traffic_monitor = create_resolver_monitor(traffic_cfg, self._enqueue_packet)
+        self.process_thread: Optional[threading.Thread] = None
+        self.monitor_thread: Optional[threading.Thread] = None
+        self.cleanup_thread: Optional[threading.Thread] = None
         
         # Analysis server
-        self.analysis_server = None
-        if config.common.enable_analysis_server:
-            self.analysis_server = CacheAnalysisServer(self, config.common.analysis_port)
-        
-        # Statistics
-        self.stats = {
-            'total_snapshots': 0,
-            'total_changes': 0,
-            'records_added': 0,
-            'records_removed': 0,
-            'records_modified': 0,
-        }
-    
-    def _cache_impl(self, config: CacheConfig) -> AbstractCacheMonitor:
-        """Reflectively get cache monitor implementation"""
-        server_type = config.server_type.lower()
-        impl_class_name = f"{server_type.capitalize()}CacheMonitor"
-        current_module = sys.modules[__name__]
-        if hasattr(current_module, impl_class_name):
-            impl_class = getattr(current_module, impl_class_name)
-            if issubclass(impl_class, AbstractCacheMonitor):
-                self.logger.debug(f"Using {impl_class_name} for {config.server_type} cache monitoring")
-                return impl_class(config)
-        raise ValueError(f"Unsupported DNS server type: {config.server_type}")
-    
-    def start(self) -> None:
-        """Start cache monitoring"""
+        self.analysis_server = self._setup_server()
+
+    # Initialization and thread management methods
+    def _setup_server(self):
+        if self.config.common.enable_analysis_server:
+            addr = (self.config.common.analysis_address, self.config.common.analysis_port)
+            return CacheAnalysisServer(addr, CacheRequestHandler, self)
+        return None
+
+    def start(self):
         self.logger.info(f"Starting {self.config.server_type} cache monitoring...")
-        self.running = True
-        
-        try:
-            # Start analysis server if enabled
-            if self.analysis_server:
-                server_thread = threading.Thread(target=self.analysis_server.start, daemon=True)
-                server_thread.start()
-            
-            # Take initial snapshot
-            self.current_snapshot = self._take_snapshot()
-            if self.current_snapshot:
-                self.logger.info(f"Initial snapshot: {self.current_snapshot.get_record_count()} records")
-                self._print_cache_summary(self.current_snapshot)
-            
-            # Start monitoring loop
-            self._monitoring_loop()
-            
-        except KeyboardInterrupt:
-            self.logger.info("Monitoring interrupted by user")
-        except Exception as e:
-            self.logger.error(f"Cache monitoring failed: {e}")
-        finally:
-            self.stop()
-    
-    def stop(self) -> None:
-        """Stop cache monitoring"""
-        self.logger.info("Stopping cache monitoring...")
-        self.running = False
-        
+        self.running.set()
+
+        self.logger.info("Taking initial cache snapshot...")
+        self.current_snapshot = self._take_snapshot(None)
+
+        self.process_thread = threading.Thread(target=self._process_worker, daemon=True)
+        self.process_thread.start()
+
+        self.monitor_thread = threading.Thread(target=self._monitoring_loop, daemon=True)
+        self.monitor_thread.start()
+
+        self.cleanup_thread = threading.Thread(target=self._cleanup_pd_query, daemon=True)
+        self.cleanup_thread.start()
+
         if self.analysis_server:
-            self.analysis_server.stop()
+            threading.Thread(target=self.analysis_server.serve_forever, daemon=True).start()
+
+        self.logger.info(f"Listening for DNS traffic involving {self.config.common.resolver_ip}...")
+        self.traffic_monitor.start()
+
+    def stop(self):
+        self.logger.info("Stopping cache monitoring...")
+        self.running.clear()
+        self.traffic_monitor.stop()
+
+        if self.analysis_server:
+            self.analysis_server.shutdown()
         
-        # Save final statistics
-        self._save_statistics()
+        self.trigger_queue.put(None) # Sentinel for monitor_thread
+        if self.process_thread and self.process_thread.is_alive(): 
+            self.process_thread.join(timeout=2)
+        if self.monitor_thread and self.monitor_thread.is_alive(): 
+            self.monitor_thread.join(timeout=2)
+        if self.cleanup_thread and self.cleanup_thread.is_alive(): 
+            self.cleanup_thread.join(timeout=2)
         
-        self.logger.info("Cache monitoring stopped")
+        self.logger.info("Cache monitoring stopped.")
     
-    def _monitoring_loop(self) -> None:
-        """Main monitoring loop"""
-        last_report_time = time.time()
-        
-        while self.running:
+    def _enqueue_packet(self, packet: DNSPacket):
+        """Keep it fast."""
+        try:
+            self.packet_queue.put_nowait(packet)
+        except queue.Full:
+            self.logger.warning("Packet queue is full, dropped.")
+
+    def _process_worker(self):
+        """Continuously processes packets from the packet_queue."""
+        self.logger.debug("Packet processing worker started.")
+        while self.running.is_set():
             try:
-                # Take new snapshot
-                new_snapshot = self._take_snapshot()
-                if not new_snapshot:
-                    time.sleep(self.config.common.interval)
-                    continue
-                
-                # Compare with previous snapshot
-                if self.current_snapshot:
-                    diff = CacheDiff(self.current_snapshot, new_snapshot)
-                    
-                    if diff.has_changes():
-                        self._process_cache_changes(diff)
-                        self.stats['total_changes'] += 1
-                        self.stats['records_added'] += len(diff.added_records)
-                        self.stats['records_removed'] += len(diff.removed_records)
-                        self.stats['records_modified'] += len(diff.modified_records)
-                
-                # Update snapshots
-                self.previous_snapshot = self.current_snapshot
-                self.current_snapshot = new_snapshot
-                self.stats['total_snapshots'] += 1
-                
-                # Print periodic status
-                current_time = time.time()
-                if current_time - last_report_time >= 60:  # Every minute
-                    self._print_status()
-                    last_report_time = current_time
-                
-                time.sleep(self.config.common.interval)
-                
+                packet = self.packet_queue.get(timeout=1.0)
+                if packet is None: # Sentinel
+                    break
+                self._process_packet(packet)
+            except queue.Empty:
+                continue
             except Exception as e:
-                self.logger.error(f"Error in monitoring loop: {e}")
-                time.sleep(self.config.common.interval)
-    
-    def _take_snapshot(self) -> Optional[CacheSnapshot]:
-        """Take a cache snapshot"""
+                self.logger.error(f"Error in packet processing worker: {e}", exc_info=True)
+        self.logger.debug("Packet processing worker stopped.")
+
+    def _process_packet(self, packet: DNSPacket):
+        resolver_ip = self.config.common.resolver_ip
+        
+        with self.trans_lock:
+            if not packet.is_response and packet.dst_ip == resolver_ip:
+                key = (packet.src_ip, packet.src_port, packet.query_id)
+                self.pd_query[key] = PendingQuery(query=packet, timestamp=time.time())
+                self.logger.debug(f"Tracking new query: {packet.qname} from {packet.src_ip}:{packet.src_port}")
+
+            elif packet.is_response and packet.src_ip == resolver_ip:
+                key = (packet.dst_ip, packet.dst_port, packet.query_id)
+                if key in self.pd_query:
+                    pending = self.pd_query.pop(key)
+                    self.logger.debug(f"Matched response for: {pending.query.qname}")
+                    try:
+                        self.trigger_queue.put_nowait(packet)
+                    except queue.Full:
+                        self.logger.warning("Trigger queue full, dropping transaction completion trigger.")
+
+    def _cleanup_pd_query(self):
+        while self.running.is_set():
+            time.sleep(self.TRANSACTION_TIMEOUT)
+            with self.trans_lock:
+                now = time.time()
+                expired_keys = [
+                    key for key, trans in self.pd_query.items()
+                    if now - trans.timestamp > self.TRANSACTION_TIMEOUT
+                ]
+                for key in expired_keys:
+                    trans = self.pd_query.pop(key)
+                    self.logger.debug(f"Timing out tracked query for {trans.query.qname}")
+
+    def _monitoring_loop(self):
+        last_dump_time = 0.0
+        while self.running.is_set():
+            try:
+                trigger_packet = self.trigger_queue.get(timeout=1.0)
+                if trigger_packet is None: 
+                    break
+
+                if time.time() - last_dump_time < self.config.common.cooldown_period:
+                    continue
+
+                self.logger.info(f"Transaction for '{trigger_packet.qname}' completed. Triggering cache dump.")
+                
+                new_snapshot = self._take_snapshot(trigger_packet)
+                last_dump_time = time.time()
+                
+                with self.lock:
+                    if new_snapshot and self.current_snapshot:
+                        diff = CacheDiff(self.current_snapshot, new_snapshot)
+                        if diff.has_changes():
+                            self.last_diff = diff
+                            self.print(diff)
+                    self.current_snapshot = new_snapshot
+
+            except queue.Empty:
+                continue
+            except Exception as e:
+                self.logger.error(f"Error in monitoring loop: {e}", exc_info=True)
+
+    def _take_snapshot(self, trigger: Optional[DNSPacket]) -> Optional[CacheSnapshot]:
         try:
             cache_data = self.cache_impl.dump_cache()
             if cache_data:
-                return self.cache_impl.parse_cache(cache_data)
+                return self.cache_impl.parse_cache(cache_data, trigger)
             return None
         except Exception as e:
             self.logger.error(f"Failed to take cache snapshot: {e}")
             return None
-    
-    def _process_cache_changes(self, diff: CacheDiff) -> None:
-        """Process and log cache changes"""
+
+    def print(self, diff: CacheDiff):
         summary = diff.get_summary()
-        
         self.logger.info(
-            f"{colorize('CACHE CHANGES', Colors.CYAN)}: "
-            f"+{summary['added']} -{summary['removed']} ~{summary['modified']}"
+            f"{colorize('CACHE CHANGES DETECTED', Colors.CYAN)}: "
+            f"+{summary['added']} added, -{summary['removed']} removed, ~{summary['modified']} modified TTL"
         )
+        for record in diff.added_records[:5]:
+            self.logger.info(f"  {colorize('+', Colors.GREEN)} {record}")
         
-        # Log added records
-        for record in diff.added_records[:5]:  # Limit to first 5
-            self.logger.info(f"  {colorize('ADDED', Colors.GREEN)}: {record}")
-        
-        if len(diff.added_records) > 5:
-            self.logger.info(f"  ... and {len(diff.added_records) - 5} more added records")
-        
-        # Log removed records
-        for record in diff.removed_records[:5]:  # Limit to first 5
-            self.logger.info(f"  {colorize('REMOVED', Colors.RED)}: {record}")
-        
-        if len(diff.removed_records) > 5:
-            self.logger.info(f"  ... and {len(diff.removed_records) - 5} more removed records")
-        
-        # Log modified records
-        for mod in diff.modified_records[:3]:  # Limit to first 3
-            old_record = mod['old']
-            new_record = mod['new']
-            self.logger.info(f"  {colorize('MODIFIED', Colors.YELLOW)}: {old_record['name']}")
-            self.logger.info(f"    Old: {old_record['data']} (TTL: {old_record['ttl']})")
-            self.logger.info(f"    New: {new_record['data']} (TTL: {new_record['ttl']})")
-        
-        if len(diff.modified_records) > 3:
-            self.logger.info(f"  ... and {len(diff.modified_records) - 3} more modified records")
-        
-        # Save detailed changes if configured
         if self.config.common.save_changes:
             self._save_cache_changes(diff)
-    
-    def _print_cache_summary(self, snapshot: CacheSnapshot) -> None:
-        """Print cache summary"""
-        print(f"\n{Colors.BOLD}{Colors.CYAN}Cache Summary{Colors.RESET}")
-        print(f"{Colors.CYAN}{'='*40}{Colors.RESET}")
-        print(f"Total records: {colorize(str(snapshot.get_record_count()), Colors.GREEN)}")
-        
-        records_by_type = snapshot.get_records_by_type()
-        for rtype, count in sorted(records_by_type.items()):
-            print(f"  {rtype}: {colorize(str(count), Colors.YELLOW)}")
-        
-        print(f"{Colors.CYAN}{'='*40}{Colors.RESET}\n")
-    
-    def _print_status(self) -> None:
-        """Print monitoring status"""
-        print(f"\n{Colors.BOLD}Cache Monitor Status{Colors.RESET}")
-        print(f"Snapshots taken: {colorize(str(self.stats['total_snapshots']), Colors.CYAN)}")
-        print(f"Changes detected: {colorize(str(self.stats['total_changes']), Colors.YELLOW)}")
-        print(f"Records added: {colorize(str(self.stats['records_added']), Colors.GREEN)}")
-        print(f"Records removed: {colorize(str(self.stats['records_removed']), Colors.RED)}")
-        print(f"Records modified: {colorize(str(self.stats['records_modified']), Colors.MAGENTA)}")
-        
-        if self.current_snapshot:
-            print(f"Current cache size: {colorize(str(self.current_snapshot.get_record_count()), Colors.CYAN)}")
-    
-    def _save_cache_changes(self, diff: CacheDiff) -> None:
-        """Save cache changes to file"""
+
+    def _save_cache_changes(self, diff: CacheDiff):
         try:
             timestamp = get_timestamp()
-            changes_file = f"cache_changes_{timestamp}.json"
-            save_json(diff.to_dict(), changes_file)
-            
-            self.logger.debug(f"Cache changes saved to: {changes_file}")
-            
+            path = Path(self.config.common.cache_changes_dir)
+            path.mkdir(parents=True, exist_ok=True)
+            filename = path / f"cache_diff_{timestamp}.json"
+            save_json(diff.to_dict(), str(filename))
+            self.logger.debug(f"Cache changes saved to: {filename}")
         except Exception as e:
             self.logger.error(f"Failed to save cache changes: {e}")
-    
-    def _save_statistics(self) -> None:
-        """Save monitoring statistics"""
-        try:
-            stats_data = {
-                'config': {
-                    'server_type': self.config.server_type,
-                    'interval': self.config.common.interval,
-                },
-                'statistics': self.stats,
-                'final_snapshot': self.current_snapshot.to_dict() if self.current_snapshot else None,
-            }
-            
-            timestamp = get_timestamp()
-            stats_file = f"cache_monitor_stats_{timestamp}.json"
-            save_json(stats_data, stats_file)
-            
-            self.logger.info(f"Statistics saved to: {stats_file}")
-            
-        except Exception as e:
-            self.logger.error(f"Failed to save statistics: {e}")
-    
-    def analyze_cache_changes(self) -> Optional[CacheDiff]:
-        """Analyze current cache changes (for analysis server)"""
-        try:
-            new_snapshot = self._take_snapshot()
-            if not new_snapshot or not self.current_snapshot:
-                return None
-            
-            diff = CacheDiff(self.current_snapshot, new_snapshot)
-            
-            # Update current snapshot
-            self.current_snapshot = new_snapshot
-            
-            return diff if diff.has_changes() else None
-            
-        except Exception as e:
-            self.logger.error(f"Failed to analyze cache changes: {e}")
-            return None

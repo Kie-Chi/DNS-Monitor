@@ -193,42 +193,63 @@ def resolv(ctx, cidr: Optional[str], client_ip: str, resolver_ip: str, output: O
 
 
 @cli.command()
-@click.option('--software', type=click.Choice(['bind', 'unbound']),
-              required=True, help='DNS cache software type')
-@click.option('--host', help='Cache server host')
-@click.option('--port', type=int, help='Cache server port')
-@click.option('--interval', type=int, help='Cache monitor interval seconds')
+@click.option('--interface', '-i', help='Network interface to monitor traffic on')
+@click.option('--resolver-ip', '-r', required=True, help='IP address of the resolver whose cache is being monitored')
+@click.option('--software', '-sw', type=click.Choice(['bind', 'unbound']), required=True, help='DNS server software type')
+@click.option('--cooldown', '-c', type=float, help='Minimum seconds between cache dumps')
+@click.option('--save-changes', '-s', is_flag=True, default=False, help='Save detailed cache diffs to JSON files')
+@click.option('--enable-server', '-e', is_flag=True, help='Enable analysis server')
+@click.option('--analysis-address', '-a', type=str, help='Analysis server address')
+@click.option('--analysis-port', '-p', type=int, help='Analysis server port')
+# BIND specific options
+@click.option('--rndc-key-file', '-k', help='Path to rndc.key file (for BIND)')
+@click.option('--dump-file', '-d', help='Path to the cache dump file (for BIND)')
+# Unbound specific options
+@click.option('--unbound-control-config', '-uc', help='Path to unbound-control config file (for Unbound)')
 @click.pass_context
-def cache(ctx, software: str, host: Optional[str], port: Optional[int], interval: Optional[int]):
-    """Monitor DNS cache changes"""
-    config = ctx.obj['config']
+def cache(ctx, interface: Optional[str], resolver_ip: str, software: str, cooldown: Optional[float], save_changes: bool, enable_server: bool, analysis_address: Optional[str], analysis_port: Optional[int], rndc_key_file: Optional[str], dump_file: Optional[str], unbound_control_config: Optional[str]):
+    """Monitor DNS cache changes, triggered by resolver traffic."""
+    config = ctx.obj['config'].cache
     logger = ctx.obj['logger']
     
-    config.cache.server_type = software
-    config.cache.software = software
-    if host:
-        config.cache.host = host
-    if port:
-        config.cache.port = port
-    if interval:
-        config.cache.interval = interval
+    # Common settings
+    if interface: config.common.interface = interface
+    config.common.resolver_ip = resolver_ip
+    if cooldown: config.common.cooldown_period = cooldown
+    config.common.save_changes = save_changes
+    if enable_server: config.common.enable_analysis_server = True
+    if analysis_address: config.common.analysis_address = analysis_address
+    if analysis_port: config.common.analysis_port = analysis_port
     
-    print_header("DNS Cache Monitor Starting")
-    print_info(f"Software: {config.cache.software}")
-    print_info(f"Host: {config.cache.host}")
-    print_info(f"Port: {config.cache.port}")
-    print_info(f"Interval: {config.cache.interval}s")
+    # Software-specific settings
+    config.server_type = software
+    if software == 'bind':
+        if rndc_key_file: config.bind.rndc_key_file = rndc_key_file
+        if dump_file: config.bind.dump_file = dump_file
+    elif software == 'unbound':
+        if unbound_control_config: config.unbound.control_config = unbound_control_config
     
+    # --- Print startup info ---
+    print_header("DNS Cache Monitor Starting (Event-Driven)")
+    print_info(f"Monitoring Interface: {config.common.interface}")
+    print_info(f"Target Resolver IP: {config.common.resolver_ip}")
+    print_info(f"DNS Software: {config.server_type.upper()}")
+    print_info(f"Cooldown Period: {config.common.cooldown_period}s")
+    if save_changes: print_info("Saving cache changes: Enabled")
+    if config.common.enable_analysis_server:
+        print_info(f"Analysis Server: Enabled on port {config.common.analysis_port}")
+
     try:
         from .cache import CacheMonitor
-        monitor = CacheMonitor(config.cache)
-        monitor.start()
+        monitor_service = CacheMonitor(config)
+        monitor_service.start()
     except KeyboardInterrupt:
-        print_info("Cache monitoring stopped by user")
+        print_info("\nCache monitoring stopped by user.")
     except Exception as e:
         print_error(f"Cache monitoring failed: {e}")
         logger.exception("Cache monitoring error")
         sys.exit(1)
+
 
 
 @cli.command()
