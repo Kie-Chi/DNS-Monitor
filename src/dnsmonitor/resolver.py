@@ -15,6 +15,8 @@ import socketserver
 from typing import List, Optional, Dict, Any
 from dataclasses import asdict
 from pathlib import Path
+from collections import defaultdict
+from dataclasses import field, dataclass
 from .traffic import create_resolver_monitor
 from .packet import DNSPacket, RCODE_MAP
 from .config import ResolverConfig, TrafficConfig
@@ -23,28 +25,72 @@ from .utils.common import get_timestamp, save_json
 from .utils import Colors, colorize
 
 
+@dataclass(slots=True)
+class RecursiveStep:
+    """Represents one step in the recursive resolution process."""
+    query: DNSPacket
+    server_ip: str
+    response: Optional[DNSPacket] = None
+
+    @property
+    def duration(self) -> Optional[float]:
+        if self.response:
+            return self.response.timestamp - self.query.timestamp
+        return None
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "query": self.query.to_dict(),
+            "response": self.response.to_dict() if self.response else None,
+            "server_ip": self.server_ip,
+            "duration": self.duration
+        }
+
+@dataclass(slots=True)
+class AnalyzedPath:
+    """Holds the structured result of a transaction analysis."""
+    steps: List[RecursiveStep]
+    stats: Dict[str, Any]
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "steps": [s.to_dict() for s in self.steps],
+            "stats": self.stats
+        }
+
+
+@dataclass(slots=True)
 class DNSTransaction:
     """Represents a DNS transaction from query to response. Populated after collection."""
     
-    def __init__(self, query_packet: DNSPacket):
-        self.query_id = query_packet.query_id
-        self.client_ip = query_packet.src_ip
-        self.resolver_ip = query_packet.dst_ip
-        self.query_name = query_packet.qname
-        self.query_type = query_packet.qtype
-        self.start_time = query_packet.timestamp
-        self.end_time: Optional[float] = None
-        self.response_packet: Optional[DNSPacket] = None
-        self.resolution_path: List[Dict[str, Any]] = []
-        self.status = 'PENDING'
-        self.rcode: Optional[int] = None
-        self.answer_count = 0
-        self.authority_count = 0
-        self.additional_count = 0
+    query_packet: DNSPacket
+    # Fields initialized from query_packet
+    query_id: int = field(init=False)
+    client_ip: str = field(init=False)
+    resolver_ip: str = field(init=False)
+    query_name: str = field(init=False)
+    query_type: str = field(init=False)
+    start_time: float = field(init=False)
     
-    def add_resolv_pkt(self, packet: DNSPacket) -> None:
-        """Add a packet to the resolution path."""
-        self.resolution_path.append(packet.to_dict())
+    # Fields populated during processing
+    end_time: Optional[float] = None
+    response_packet: Optional[DNSPacket] = None
+    status: str = 'PENDING'
+    rcode: Optional[int] = None
+    answer_count: int = 0
+    authority_count: int = 0
+    additional_count: int = 0
+    # Stores the result of analysis
+    _r_pkts: List[DNSPacket] = field(default_factory=list, repr=False)
+    analyzed_path: Optional[AnalyzedPath] = None
+
+    def __post_init__(self):
+        self.query_id = self.query_packet.query_id
+        self.client_ip = self.query_packet.src_ip
+        self.resolver_ip = self.query_packet.dst_ip
+        self.query_name = self.query_packet.qname
+        self.query_type = self.query_packet.qtype
+        self.start_time = self.query_packet.timestamp
     
     def complete(self, response_packet: DNSPacket) -> None:
         """Finalize the transaction with a successful response."""
@@ -60,13 +106,17 @@ class DNSTransaction:
         """Mark the transaction as timed out."""
         self.status = 'TIMEOUT'
         self.end_time = time.time()
+
+    def add_resolv_pkt(self, packet: DNSPacket) -> None:
+        """Add a raw packet object to the transaction for later analysis."""
+        self._r_pkts.append(packet)
     
     @property
     def duration(self) -> Optional[float]:
         """Get transaction duration in seconds."""
         if self.end_time:
             return self.end_time - self.start_time
-        return None
+        return None 
     
     def to_dict(self) -> Dict[str, Any]:
         """Convert transaction to a dictionary for serialization."""
@@ -84,9 +134,133 @@ class DNSTransaction:
             'answer_count': self.answer_count,
             'authority_count': self.authority_count,
             'additional_count': self.additional_count,
-            'resolution_path': self.resolution_path,
+            'analyzed_path': self.analyzed_path.to_dict() if self.analyzed_path else None,
         }
 
+
+class TransactionAnalyzer:
+    """A utility class to analyze a DNSTransaction."""
+
+    @staticmethod
+    def analyze(transaction: DNSTransaction) -> AnalyzedPath:
+        """Analyzes the raw packets"""
+        pending_queries: Dict[int, RecursiveStep] = {}
+        completed_steps: List[RecursiveStep] = []
+        resolver_ip = transaction.resolver_ip
+
+        for packet in transaction._r_pkts:
+            # Outgoing query from resolver to an upstream server
+            if not packet.is_response and packet.src_ip == resolver_ip:
+                step = RecursiveStep(query=packet, server_ip=packet.dst_ip)
+                pending_queries[packet.query_id] = step
+            
+            # Incoming response to the resolver from an upstream server
+            elif packet.is_response and packet.dst_ip == resolver_ip:
+                if packet.query_id in pending_queries:
+                    step = pending_queries.pop(packet.query_id)
+                    step.response = packet
+                    completed_steps.append(step)
+
+        timed_out_steps = list(pending_queries.values())
+        all_steps = completed_steps + timed_out_steps
+        all_steps.sort(key=lambda s: s.query.timestamp)
+        server_queries = defaultdict(int)
+        for step in all_steps:
+            server_queries[step.server_ip] += 1
+        
+        stats = {
+            "tot_resolv_qs": len(all_steps),
+            "servers": dict(server_queries)
+        }
+
+        return AnalyzedPath(steps=all_steps, stats=stats)
+
+    @staticmethod
+    def _format_rr(packet: DNSPacket) -> str:
+        """Format resource records from a packet into a readable string."""
+        parts = []
+        answers = packet.get_answers_list()
+        authorities = packet.get_authorities_list()
+
+        if answers:
+            ans_summary = []
+            for ans in answers:
+                rr_type = ans.get('type', '')
+                rdata = ans.get('rdata', {})
+                if rr_type in ['A', 'AAAA']:
+                    ans_summary.append(f"{rr_type} {rdata.get('address', '')}")
+                elif rr_type == 'CNAME':
+                    ans_summary.append(f"CNAME {rdata.get('cname', '')}")
+                else:
+                    ans_summary.append(rr_type)
+            if ans_summary:
+                parts.append(f"Answers: [{', '.join(ans_summary)}]")
+        
+        if authorities:
+            auth_summary = [auth['rdata'].get('nsname', '') for auth in authorities if auth.get('type') == 'NS']
+            if auth_summary:
+                parts.append(f"Authority: [{', '.join(auth_summary)}]")
+        
+        rcode_name = RCODE_MAP.get(packet.rcode, f"RCODE{packet.rcode}")
+        if packet.rcode != 0 and not parts:
+            parts.append(f"[{rcode_name}]")
+        elif packet.rcode == 0 and not parts:
+            parts.append("[NOERROR]")
+
+        return " ".join(parts)
+
+    @staticmethod
+    def print(transaction: DNSTransaction) -> str:
+        """Generates a detailed summary of the transaction."""
+        lines = []
+        
+        # Header
+        lines.append(colorize(
+            f"New DNS Transaction: {transaction.query_type}? {transaction.query_name}",
+            Colors.BOLD
+        ))
+        lines.append(f"[INFO] Initial Query from {transaction.client_ip}")
+
+        if not transaction.analyzed_path:
+            lines.append("[INFO] No analysis data available.")
+            return "\n".join(lines)
+
+        analyzed_path = transaction.analyzed_path
+        
+        for step in analyzed_path.steps:
+            # Query line
+            query_line = (f"-> {colorize(step.server_ip, Colors.YELLOW)}: "
+                          f"{step.query.qtype}? {step.query.qname}")
+            lines.append(query_line)
+            
+            # Response line
+            if step.response:
+                summary = TransactionAnalyzer._format_rr(step.response)
+                response_line = (f"<- {colorize(step.server_ip, Colors.YELLOW)}: "
+                                 f"{colorize(summary, Colors.GREEN)}")
+                lines.append(response_line)
+            else:
+                response_line = (f"<- {colorize(step.server_ip, Colors.YELLOW)}: "
+                                 f"{colorize('[TIMEOUT]', Colors.RED)}")
+                lines.append(response_line)
+        
+        # Final Response to client
+        if transaction.response_packet:
+            final_summary = TransactionAnalyzer._format_rr(transaction.response_packet)
+            lines.append(f"[INFO] Response to {transaction.client_ip}: {colorize(final_summary, Colors.CYAN)}")
+        else:
+            lines.append(f"[INFO] {colorize('No final response to client (TIMEOUT)', Colors.RED)}")
+        
+        # Stats summary
+        stats = analyzed_path.stats
+        if stats["tot_resolv_qs"] > 0:
+            lines.append(f"[INFO] Total recursive queries made: {stats['tot_resolv_qs']}")
+            # Sort servers for consistent output
+            sorted_servers = sorted(stats['servers'].items(), key=lambda item: item[1], reverse=True)
+            for server, count in sorted_servers:
+                lines.append(f"[INFO]   - {server}: {count} time(s)")
+                
+        return "\n".join(lines)
 
 class AnalysisServer(socketserver.ThreadingTCPServer):
     def __init__(self, server_address, RequestHandlerClass, monitor: 'ResolverMonitor') -> None:
@@ -263,14 +437,14 @@ class ResolverMonitor:
                 self._print_summary(transaction)
 
                 if len(saved_trans) >= 10 or (time.time() - last_save_time > 5):
-                    self._save_results(saved_trans)
+                    self._save_batch(saved_trans)
                     saved_trans.clear()
                     last_save_time = time.time()
                     
             except queue.Empty:
                 continue # Normal timeout, check running flag
         if saved_trans:
-            self._save_results(saved_trans, is_final=True)
+            self._save_batch(saved_trans, is_final=True)
 
         self.logger.info("Output worker stopped.")
 
@@ -404,7 +578,9 @@ class ResolverMonitor:
                 self.stats['tot_running'] += transaction.duration
         else:
             transaction.timeout()
-            
+
+        transaction.analyze_path = transaction.analyze_path(transaction)
+        
         try:
             self.output_queue.put_nowait(transaction)
         except queue.Full:
@@ -412,19 +588,8 @@ class ResolverMonitor:
 
     def _print_summary(self, t: DNSTransaction):
         """Logs a one-line summary of a processed transaction."""
-        if t.status == 'COMPLETED':
-            rcode_name = RCODE_MAP.get(t.rcode, f"RCODE{t.rcode}")
-            self.logger.info(
-                f"{colorize('TRANSACTION PROCESSED', Colors.CYAN)}: "
-                f"{t.query_name} -> {rcode_name} in {t.duration:.3f}s "
-                f"({len(t.resolution_path)} packets in path)"
-            )
-        else:
-            self.logger.warning(
-                f"{colorize('TRANSACTION TIMEOUT', Colors.RED)}: "
-                f"{t.query_name} after {t.duration:.3f}s. "
-                f"Collected {len(t.resolution_path) + 1} packets."
-            )
+        summary_str = TransactionAnalyzer.print(t)
+        print(f"\n{'-'*80}\n{summary_str}\n{'-'*80}")
 
     def _print_info(self):
         print(f"\n{Colors.BOLD}{Colors.CYAN}DNS Resolver Path Monitor{Colors.RESET}")

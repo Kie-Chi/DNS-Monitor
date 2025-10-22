@@ -72,7 +72,7 @@ class ResolverConfig:
     resolver_ip: Optional[str] = None
     timeout: int = 3
     trace_queries: bool = True
-    output_path: str = "./resolve"
+    output_path: str = "resolve"
 
     enable_server: bool = False
     analysis_port: int = DEFAULT_RESOLVE_PORT
