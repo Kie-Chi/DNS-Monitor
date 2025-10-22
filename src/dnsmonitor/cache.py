@@ -282,6 +282,7 @@ class CacheMonitor:
         self.running = threading.Event()
         self.lock = threading.Lock()
         
+        self.cache_impl = self._cache_impl(config)
         # Data storage, protected by the lock
         self.current_snapshot: Optional[CacheSnapshot] = None
         self.last_diff: Optional[CacheDiff] = None
@@ -302,6 +303,19 @@ class CacheMonitor:
         
         # Analysis server
         self.analysis_server = self._setup_server()
+
+    def _cache_impl(self, config: CacheConfig) -> AbstractCacheMonitor:
+        """Reflectively get cache monitor implementation"""
+        server_type = config.server_type.lower()
+        impl_class_name = f"{server_type.capitalize()}CacheMonitor"
+        current_module = sys.modules[__name__]
+        if hasattr(current_module, impl_class_name):
+            impl_class = getattr(current_module, impl_class_name)
+            if issubclass(impl_class, AbstractCacheMonitor):
+                self.logger.debug(f"Using {impl_class_name} for {config.server_type} cache monitoring")
+                return impl_class(config)
+        raise ValueError(f"Unsupported DNS server type: {config.server_type}")
+        
 
     # Initialization and thread management methods
     def _setup_server(self):
