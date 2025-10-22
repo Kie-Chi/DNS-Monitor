@@ -34,6 +34,9 @@ class MonitorMode(Enum):
     RESOLVER_ONLY = "resolver_only"  # only provide to resolver analysis
     MIXED = "mixed"                  # mixed mode
 
+    def __str__(self):
+        return self.value.lower()
+
 
 class OptimizedTrafficMonitor:
     """optimized traffic monitor"""

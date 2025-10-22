@@ -8,6 +8,7 @@ from typing import Optional
 
 from .config import ConfigManager
 from .monitor import DNSMonitor
+from .traffic import OptimizedTrafficMonitor, MonitorMode
 from .utils.logger import setup_logger, get_logger
 from .utils import print_header, print_info, print_error, Colors
 
@@ -52,9 +53,7 @@ def cli(ctx, config: Optional[str], log_level: str, log_file: Optional[str]):
               help='DNS cache software type')
 @click.option('--output-dir', '-o', help='Output directory for results')
 @click.pass_context
-def monitor(ctx, interface: Optional[str], client_ip: Optional[str], 
-           resolver_ip: Optional[str], cache_software: Optional[str],
-           output_dir: Optional[str]):
+def monitor(ctx, interface: Optional[str], client_ip: Optional[str], resolver_ip: Optional[str], cache_software: Optional[str], output_dir: Optional[str]):
     """Start comprehensive DNS monitoring"""
     config = ctx.obj['config']
     logger = ctx.obj['logger']
@@ -93,11 +92,16 @@ def monitor(ctx, interface: Optional[str], client_ip: Optional[str],
 @cli.command()
 @click.option('--interface', '-i', help='Network interface to monitor')
 @click.option('--output-dir', '-o', help='Output directory for PCAP files')
-@click.option('--rotation-size', type=int, help='PCAP rotation size in MB')
-@click.option('--rotation-time', type=int, help='PCAP rotation time in seconds')
+@click.option('--rotation-size', '-rz', type=int, help='PCAP rotation size in MB')
+@click.option('--rotation-time', '-rt', type=int, help='PCAP rotation time in seconds')
+@click.option('--bpf-filter', '-f', help='BPF filter expression')
+@click.option(
+    '--mode', '-m',
+    type=click.Choice([str(m) for m in MonitorMode]), 
+    help='Monitoring mode'
+)
 @click.pass_context
-def traffic(ctx, interface: Optional[str], output_dir: Optional[str],
-           rotation_size: Optional[int], rotation_time: Optional[int]):
+def traffic(ctx, interface: Optional[str], output_dir: Optional[str], rotation_size: Optional[int], rotation_time: Optional[int], bpf_filter: Optional[str], mode: Optional[str]):
     """Monitor DNS traffic only"""
     config = ctx.obj['config']
     logger = ctx.obj['logger']
@@ -111,16 +115,21 @@ def traffic(ctx, interface: Optional[str], output_dir: Optional[str],
         config.traffic.pcap_rotation_size = rotation_size
     if rotation_time:
         config.traffic.pcap_rotation_time = rotation_time
-    
+    if bpf_filter:
+        config.traffic.bpf_filter = bpf_filter
+    if not mode:
+        mode = str(MonitorMode.DISPLAY_ONLY)
+
     print_header("DNS Traffic Monitor Starting")
     print_info(f"Interface: {config.traffic.interface}")
     print_info(f"Output Directory: {config.traffic.pcap_dir}")
     print_info(f"Rotation Size: {config.traffic.pcap_rotation_size} MB")
     print_info(f"Rotation Time: {config.traffic.pcap_rotation_time} seconds")
+    print_info(f"Mode: {mode}")
     
     try:
-        from .traffic import TrafficMonitor
-        monitor = TrafficMonitor(config.traffic)
+        monitor_mode = MonitorMode(mode)
+        monitor = OptimizedTrafficMonitor(config.traffic, mode=monitor_mode)
         monitor.start()
     except KeyboardInterrupt:
         print_info("Traffic monitoring stopped by user")

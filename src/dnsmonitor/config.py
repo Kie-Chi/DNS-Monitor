@@ -14,7 +14,7 @@ from .constants import DEFAULT_CACHE_INTERVAL, DEFAULT_ANALYSIS_PORT
 @dataclass
 class TrafficConfig:
     """DNS Traffic Monitoring Configuration"""
-    interface: str = "eth0"
+    interface: str = "any"
     pcap_dir: str = "./pcap"
     pcap_rotation_size: int = 100  # MB
     pcap_rotation_time: int = 3600  # seconds
