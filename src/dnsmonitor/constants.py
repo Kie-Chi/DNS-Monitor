@@ -46,6 +46,7 @@ DEFAULT_ANALYSIS_PORT = 8080
 
 # --- Resolver Monitoring ---
 DEFAULT_TRANSACTION_TIMEOUT = 10.0  # seconds
+DEFAULT_RESOLVE_PORT = 12345
 
 # --- Traffic Monitoring ---
 DEFAULT_CAPTURE_BUFFER_SIZE = 65536

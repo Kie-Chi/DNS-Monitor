@@ -140,11 +140,14 @@ def traffic(ctx, interface: Optional[str], output_dir: Optional[str], rotation_s
 
 
 @cli.command()
-@click.option('--client-ip', required=True, help='Client IP address')
-@click.option('--resolver-ip', required=True, help='Resolver IP address')
-@click.option('--timeout', type=int, help='Query timeout in seconds')
+@click.option('--client-ip', '-c', required=True, help='Client IP address')
+@click.option('--resolver-ip', '-r', required=True, help='Resolver IP address')
+@click.option('--output', '-o', help='Output file path')
+@click.option('--enable-server', '-s', is_flag=True, help='Enable server monitoring')
+@click.option('--analysis-port', '-p', type=int, help='Analysis server port')
+@click.option('--timeout', '-t', type=int, help='Query timeout in seconds')
 @click.pass_context
-def resolver(ctx, client_ip: str, resolver_ip: str, timeout: Optional[int]):
+def resolv(ctx, client_ip: str, resolver_ip: str, output: Optional[str], enable_server: bool, analysis_port: Optional[int], timeout: Optional[int]):  
     """Monitor DNS resolution path"""
     config = ctx.obj['config']
     logger = ctx.obj['logger']
@@ -153,6 +156,12 @@ def resolver(ctx, client_ip: str, resolver_ip: str, timeout: Optional[int]):
     config.resolver.resolver_ip = resolver_ip
     if timeout:
         config.resolver.timeout = timeout
+    if output:
+        config.resolver.output_path = output
+    if enable_server:
+        config.resolver.enable_server = enable_server
+        if analysis_port:
+            config.resolver.analysis_port = analysis_port
     
     print_header("DNS Resolver Monitor Starting")
     print_info(f"Client IP: {config.resolver.client_ip}")

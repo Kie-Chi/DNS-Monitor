@@ -8,7 +8,7 @@ from typing import Optional
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .constants import DEFAULT_CACHE_INTERVAL, DEFAULT_ANALYSIS_PORT
+from .constants import DEFAULT_CACHE_INTERVAL, DEFAULT_ANALYSIS_PORT, DEFAULT_RESOLVE_PORT
 
 
 @dataclass
@@ -69,9 +69,12 @@ class ResolverConfig:
     """Resolver path monitoring configuration"""
     client_ip: Optional[str] = None
     resolver_ip: Optional[str] = None
-    timeout: int = 30
-    bpf_filter: str = "port 53"
+    timeout: int = 3
     trace_queries: bool = True
+    output_path: str = "./resolve"
+
+    enable_server: bool = False
+    analysis_port: int = DEFAULT_RESOLVE_PORT
 
 
 # -------------------------
