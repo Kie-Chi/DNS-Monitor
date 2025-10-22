@@ -579,7 +579,7 @@ class ResolverMonitor:
         else:
             transaction.timeout()
 
-        transaction.analyzed_path = transaction.analyze_path(transaction)
+        transaction.analyzed_path = TransactionAnalyzer.analyze(transaction)
         
         try:
             self.output_queue.put_nowait(transaction)

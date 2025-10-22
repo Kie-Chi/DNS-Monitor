@@ -10,7 +10,8 @@ import dpkt
 
 # --- Packet ---
 DNS_TYPE_MAP = {
-    1: "A", 2: "NS", 5: "CNAME", 6: "SOA", 12: "PTR", 15: "MX", 16: "TXT", 28: "AAAA"
+    1: "A", 2: "NS", 5: "CNAME", 6: "SOA", 12: "PTR", 15: "MX", 16: "TXT", 28: "AAAA",
+    41: "OPT"
 }
 RCODE_MAP = {
     0: "NOERROR", 1: "FORMERR", 2: "SERVFAIL", 3: "NXDOMAIN", 4: "NOTIMP", 5: "REFUSED"
@@ -49,6 +50,14 @@ class DNSPacket:
     # Lightweight caches (only for frequently accessed data)
     _qname_cache: Optional[str] = field(default=None, init=False, repr=False)
     _qtype_cache: Optional[str] = field(default=None, init=False, repr=False)
+
+    def _format_name(self, name_field: Union[str, bytes]) -> str:
+        """Decodes bytes to string and formats the root domain correctly."""
+        try:
+            decoded_name = name_field.decode('utf-8', errors='replace') if isinstance(name_field, bytes) else name_field
+            return "." if decoded_name == "" else decoded_name
+        except Exception:
+            return ""
     
     @property
     def dpkt_dns(self) -> Optional[dpkt.dns.DNS]:
@@ -88,8 +97,7 @@ class DNSPacket:
             dns = self.dpkt_dns
             if dns and dns.qd:
                 try:
-                    name = dns.qd[0].name
-                    self._qname_cache = name if isinstance(name, str) else name.decode('utf-8', errors='replace')
+                    self._qname_cache = self._format_name(dns.qd[0].name)
                 except Exception:
                     self._qname_cache = ""
             else:
@@ -152,9 +160,8 @@ class DNSPacket:
     def get_question_dict(self, q: dpkt.dns.DNS.Q) -> Dict[str, Any]:
         """Convert question to dictionary"""
         try:
-            name = q.name if isinstance(q.name, str) else q.name.decode('utf-8', errors='replace')
             return {
-                'name': name,
+                'name': self._format_name(q.name),
                 'type': self._get_qtype_name(q.type),
                 'class': q.cls
             }
@@ -164,12 +171,11 @@ class DNSPacket:
     def get_rr_dict(self, rr: dpkt.dns.DNS.RR) -> Dict[str, Any]:
         """Convert resource record to dictionary with optimized parsing"""
         try:
-            name = rr.name if isinstance(rr.name, str) else rr.name.decode('utf-8', errors='replace')
             rr_type = self._get_qtype_name(rr.type)
             
             # basic fields
             result = {
-                'name': name,
+                'name': self._format_name(rr.name),
                 'type': rr_type,
                 'class': rr.cls,
                 'ttl': rr.ttl,
@@ -178,49 +184,52 @@ class DNSPacket:
             
             # parse rdata based on type
             try:
-                if rr.type == dpkt.dns.DNS_A:  # A
+                if rr.type == dpkt.dns.DNS_OPT:
+                    result['class'] = 0
+                    result['ttl'] = 0
+                    result['edns'] = {
+                        'udp_payload_size': rr.cls,
+                        'ext_rcode': (rr.ttl >> 24) & 0xff,
+                        'version': (rr.ttl >> 16) & 0xff,
+                        'flags': rr.ttl & 0xffff,
+                        'do_bit': bool(rr.ttl & 0x8000)
+                    }
+                    result['rdata'] = {'options': rr.rdata.hex() if rr.rdata else ""}
+                elif rr.type == dpkt.dns.DNS_A:
                     if len(rr.rdata) == 4:
                         result['rdata']['address'] = socket.inet_ntoa(rr.rdata)
-                elif rr.type == dpkt.dns.DNS_AAAA:  # AAAA
+                elif rr.type == dpkt.dns.DNS_AAAA:
                     if len(rr.rdata) == 16:
                         result['rdata']['address'] = socket.inet_ntop(socket.AF_INET6, rr.rdata)
-                elif rr.type == dpkt.dns.DNS_CNAME:  # CNAME
-                    cname = rr.cname if isinstance(rr.cname, str) else rr.cname.decode('utf-8', errors='replace')
-                    result['rdata']['cname'] = cname
-                elif rr.type == dpkt.dns.DNS_MX:  # MX
-                    exchange = rr.mxname if isinstance(rr.mxname, str) else rr.mxname.decode('utf-8', errors='replace')
-                    result['rdata'] = {'preference': rr.preference, 'exchange': exchange}
-                elif rr.type == dpkt.dns.DNS_NS:  # NS
-                    nsname = rr.nsname if isinstance(rr.nsname, str) else rr.nsname.decode('utf-8', errors='replace')
-                    result['rdata']['nsname'] = nsname
-                elif rr.type == dpkt.dns.DNS_PTR:  # PTR
-                    ptrname = rr.ptrname if isinstance(rr.ptrname, str) else rr.ptrname.decode('utf-8', errors='replace')
-                    result['rdata']['ptrname'] = ptrname
-                elif rr.type == dpkt.dns.DNS_SOA:  # SOA
-                    mname = rr.mname if isinstance(rr.mname, str) else rr.mname.decode('utf-8', errors='replace')
-                    rname = rr.rname if isinstance(rr.rname, str) else rr.rname.decode('utf-8', errors='replace')
+                elif rr.type == dpkt.dns.DNS_CNAME:
+                    result['rdata']['cname'] = self._format_name(rr.cname)
+                elif rr.type == dpkt.dns.DNS_MX:
+                    result['rdata'] = {'preference': rr.preference, 'exchange': self._format_name(rr.mxname)}
+                elif rr.type == dpkt.dns.DNS_NS:
+                    result['rdata']['nsname'] = self._format_name(rr.nsname)
+                elif rr.type == dpkt.dns.DNS_PTR:
+                    result['rdata']['ptrname'] = self._format_name(rr.ptrname)
+                elif rr.type == dpkt.dns.DNS_SOA:
                     result['rdata'] = {
-                        'mname': mname, 'rname': rname, 'serial': rr.serial,
-                        'refresh': rr.refresh, 'retry': rr.retry, 'expire': rr.expire, 'minimum': rr.minimum
+                        'mname': self._format_name(rr.mname), 
+                        'rname': self._format_name(rr.rname),
+                        'serial': rr.serial, 'refresh': rr.refresh, 'retry': rr.retry,
+                        'expire': rr.expire, 'minimum': rr.minimum
                     }
-                elif rr.type == dpkt.dns.DNS_TXT:  # TXT
+                elif rr.type == dpkt.dns.DNS_TXT:
                     try:
                         if hasattr(rr, 'text') and rr.text:
                             if isinstance(rr.text, list):
-                                if rr.text and isinstance(rr.text[0], str):
-                                    text = ''.join(rr.text)
-                                else:
-                                    text = b''.join(rr.text).decode('utf-8', errors='replace')
+                                text = (b''.join(rr.text) if rr.text and isinstance(rr.text[0], bytes) else ''.join(rr.text))
+                                result['rdata']['text'] = text.decode('utf-8', errors='replace') if isinstance(text, bytes) else text
                             else:
-                                text = rr.text if isinstance(rr.text, str) else rr.text.decode('utf-8', errors='replace')
-                            result['rdata']['text'] = text
+                                result['rdata']['text'] = rr.text.decode('utf-8', errors='replace') if isinstance(rr.text, bytes) else rr.text
                         else:
+                            # Manual parsing for malformed TXT records
                             if rr.rdata and len(rr.rdata) > 0:
                                 text_parts = []
                                 offset = 0
                                 while offset < len(rr.rdata):
-                                    if offset >= len(rr.rdata):
-                                        break
                                     length = rr.rdata[offset]
                                     if length == 0 or offset + 1 + length > len(rr.rdata):
                                         break
@@ -234,17 +243,13 @@ class DNSPacket:
                         result['rdata']['text'] = ""
                 else:
                     result['rdata']['raw'] = rr.rdata.hex() if rr.rdata else ""
-                    
             except Exception:
-                # parse error, mark as UNKNOWN
                 result['rdata'] = "UNKNOWN {}"
                 
             return result
             
         except Exception:
-            return {
-                'name': '', 'type': '', 'class': 0, 'ttl': 0, 'rdata': {}
-            }
+            return {'name': '', 'type': '', 'class': 0, 'ttl': 0, 'rdata': {}}
 
     def get_questions_list(self) -> List[Dict[str, Any]]:
         """Get questions as list of dictionaries"""
