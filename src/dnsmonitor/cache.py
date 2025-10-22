@@ -185,7 +185,7 @@ class BindCacheMonitor(AbstractCacheMonitor):
     def dump_cache(self) -> str:
         # Simplified dump logic for brevity, original logic is also fine
         try:
-            cmd = ["rndc", "-s", self.config.common.recursor_ip, "-k", self.rndc_key_file, "dumpdb", "-cache"]
+            cmd = ["rndc", "-s", self.config.common.resolver_ip, "-k", self.rndc_key_file, "dumpdb", "-cache"]
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
             if result.returncode != 0:
                 self.logger.error(f"rndc dump failed: {result.stderr}")
