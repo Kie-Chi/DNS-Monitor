@@ -193,7 +193,7 @@ def resolv(ctx, cidr: Optional[str], client_ip: str, resolver_ip: str, output: O
 
 
 @cli.command()
-@click.option('--interface', '-i', help='Network interface to monitor traffic on')
+@click.option('--cidr', '-cr', required=True, help='CIDR range to monitor')
 @click.option('--resolver-ip', '-r', required=True, help='IP address of the resolver whose cache is being monitored')
 @click.option('--software', '-sw', type=click.Choice(['bind', 'unbound']), required=True, help='DNS server software type')
 @click.option('--cooldown', '-c', type=float, help='Minimum seconds between cache dumps')
@@ -207,13 +207,16 @@ def resolv(ctx, cidr: Optional[str], client_ip: str, resolver_ip: str, output: O
 # Unbound specific options
 @click.option('--unbound-control-config', '-uc', help='Path to unbound-control config file (for Unbound)')
 @click.pass_context
-def cache(ctx, interface: Optional[str], resolver_ip: str, software: str, cooldown: Optional[float], save_changes: bool, enable_server: bool, analysis_address: Optional[str], analysis_port: Optional[int], rndc_key_file: Optional[str], dump_file: Optional[str], unbound_control_config: Optional[str]):
+def cache(ctx, cidr: str, resolver_ip: str, software: str, cooldown: Optional[float], save_changes: bool, enable_server: bool, analysis_address: Optional[str], analysis_port: Optional[int], rndc_key_file: Optional[str], dump_file: Optional[str], unbound_control_config: Optional[str]): 
     """Monitor DNS cache changes, triggered by resolver traffic."""
     config = ctx.obj['config'].cache
     logger = ctx.obj['logger']
     
     # Common settings
-    if interface: config.common.interface = interface
+    config.common.interface = get_iface(cidr)
+    if not config.common.interface:
+        print_error(f"Failed to find interface for CIDR {cidr}")
+        sys.exit(1)
     config.common.resolver_ip = resolver_ip
     if cooldown: config.common.cooldown_period = cooldown
     config.common.save_changes = save_changes
