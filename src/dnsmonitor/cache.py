@@ -15,6 +15,11 @@ from typing import Dict, List, Optional, Any, NamedTuple, Set, Tuple, override
 from dataclasses import dataclass, asdict, field
 from pathlib import Path
 import socketserver
+try:
+    from dns import name as dns_name, rdatatype, rdata, exception as dns_exception
+except ImportError:
+    print("Error: dnspython library not found. Please install it using: pip install dnspython")
+    sys.exit(1)
 
 from .traffic import create_resolver_monitor
 from .packet import DNSPacket
@@ -34,6 +39,7 @@ class DNSCacheRecord:
     rtype: str
     rdata: str
     ttl: int
+    is_neg: bool = False
     timestamp: float = field(default_factory=time.time)
     original_ttl: int = field(init=False)
 
@@ -45,13 +51,15 @@ class DNSCacheRecord:
             return False
         return (self.name == other.name and 
                 self.rtype == other.rtype and 
-                self.rdata == other.rdata)
+                self.rdata == other.rdata and
+                self.is_neg == other.is_neg)
     
     def __hash__(self):
-        return hash((self.name, self.rdata, self.rtype))
+        return hash((self.name, self.rdata, self.rtype, self.is_neg))
     
     def __str__(self):
-        return f"{self.name} {self.ttl} IN {self.rtype} {self.rdata}"
+        _marker = "\\- " if self.is_neg else ""
+        return f"{self.name} {self.ttl} IN {_marker}{self.rtype} {self.rdata}"
     
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -171,13 +179,13 @@ class AbstractCacheMonitor(ABC):
 class BindCacheMonitor(AbstractCacheMonitor):
     def __init__(self, config: CacheConfig):
         super().__init__(config)
-        self.rndc_key_file = config.bind.rndc_key_file or "/usr/local/etc/bind/rndc.key"
-        self.dump_file = config.bind.dump_file or "/usr/local/var/cache/bind/named_dump.db"
+        self.rndc_key_file = config.bind.rndc_key_file or "/usr/local/var/bind/rndc.key"
+        self.dump_file = config.bind.dump_file or "/usr/local/var/bind/named_dump.db"
     
     def dump_cache(self) -> str:
         # Simplified dump logic for brevity, original logic is also fine
         try:
-            cmd = ["rndc", "-k", self.rndc_key_file, "dumpdb", "-cache"]
+            cmd = ["rndc", "-s", self.config.common.recursor_ip, "-k", self.rndc_key_file, "dumpdb", "-cache"]
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
             if result.returncode != 0:
                 self.logger.error(f"rndc dump failed: {result.stderr}")
@@ -190,19 +198,106 @@ class BindCacheMonitor(AbstractCacheMonitor):
             self.logger.error(f"Failed to dump BIND cache: {e}")
             return ""
 
-    def parse_cache(self, cache_data: str, trigger: Optional[DNSPacket]) -> CacheSnapshot:
-        snapshot = CacheSnapshot(trigger=trigger)
-        cache_pattern = r'^([^\s;]+)\s+(\d+)\s+(?:IN)\s+([A-Z0-9]+)\s+(.+)$'
+    def parse_cache(self, cache_data: str, trigger_packet: Optional[DNSPacket]) -> CacheSnapshot:
+        """
+        Parses the BIND cache dump content with high fidelity.
+        """
+        snapshot = CacheSnapshot(trigger_packet=trigger_packet)
+        self.logger.debug("Starting comprehensive parse of BIND cache dump.")
+        
+        in_target_view = False
+        in_servfail_cache = False
+        last_domain = None
         for line in cache_data.split('\n'):
             line = line.strip()
-            if not line or line.startswith(';'):
+            if "; Start view _default" in line:
+                self.logger.debug("Entering '_default' view.")
+                in_target_view = True
+                in_servfail_cache = False
+                last_domain = None
                 continue
-            
-            match = re.match(cache_pattern, line)
-            if match:
-                name, ttl, rtype, rdata = match.groups()
-                record = DNSCacheRecord(name, rtype, rdata.strip(), int(ttl))
-                snapshot.add_record(record)
+            if in_target_view and ("; Start view" in line and "_default" not in line):
+                self.logger.debug("Leaving '_default' view.")
+                in_target_view = False
+            if not in_target_view:
+                continue
+
+            if line.startswith("; SERVFAIL cache"):
+                self.logger.debug("Entering 'SERVFAIL cache' section.")
+                in_servfail_cache = True
+                continue
+            elif line.startswith(";") and "cache" in line.lower():
+                if in_servfail_cache:
+                    self.logger.debug("Leaving 'SERVFAIL cache' section.")
+                    in_servfail_cache = False
+                continue
+            if line.startswith((";", "$")) or not line:
+                continue
+
+            try:
+                if in_servfail_cache:
+                    domain_str = line.split()[0]
+                    domain_obj = dns_name.from_text(domain_str)
+                    record = DNSCacheRecord(
+                        name=domain_obj.to_text(omit_final_dot=True),
+                        rtype="SERVFAIL",
+                        rdata="Failed lookup",
+                        ttl=0,
+                        is_neg=True
+                    )
+                    snapshot.add_record(record)
+                else:
+                    parts = line.split()
+                    if len(parts) < 2: continue
+
+                    current_domain_str, ttl_str, data_start_idx = None, None, -1
+                    if parts[0].isdigit():
+                        if last_domain:
+                            current_domain_str, ttl_str, data_start_idx = last_domain, parts[0], 1
+                        else: continue
+                    else: # Domain is present
+                        current_domain_str = parts[0]
+                        last_domain = current_domain_str
+                        if len(parts) > 1 and parts[1].isdigit():
+                            ttl_str, data_start_idx = parts[1], 2
+                        else: continue
+                    
+                    if data_start_idx == -1: continue
+
+                    ttl = int(ttl_str)
+                    offset = data_start_idx
+                    if parts[offset].upper() == "IN": offset += 1
+                    if len(parts) <= offset: continue
+
+                    rdtype_str, value_str = parts[offset], " ".join(parts[offset + 1:])
+                    is_negative = False
+                    if rdtype_str.startswith("\\-"):
+                        rdtype_str = rdtype_str[2:]
+                        is_negative = True
+
+                    domain_obj = dns_name.from_text(current_domain_str)
+                    rdtype_obj = rdatatype.from_text(rdtype_str)
+                    if not is_negative:
+                        try:
+                            rdata_obj = rdata.from_text(1, rdtype_obj, value_str, origin=domain_obj)
+                            value_str = rdata_obj.to_text()
+                        except dns_exception.DNSException:
+                            self.logger.debug(f"Could not normalize rdata, using as-is: {value_str}")
+
+                    record = DNSCacheRecord(
+                        name=domain_obj.to_text(omit_final_dot=True),
+                        rtype=rdatatype.to_text(rdtype_obj),
+                        rdata=value_str,
+                        ttl=ttl,
+                        is_neg=is_negative
+                    )
+                    snapshot.add_record(record)
+
+            except Exception as e:
+                self.logger.debug(f"Skipping line due to parsing error: '{line}'. Error: {e}")
+                continue
+        
+        self.logger.info(f"Parsed {snapshot.get_record_count()} records from BIND cache.")
         return snapshot
 
 class UnboundCacheMonitor(AbstractCacheMonitor):
