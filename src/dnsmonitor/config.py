@@ -3,18 +3,20 @@ Configuration management for DNS Monitor
 """
 
 import os
+from token import OP
 import yaml
-from typing import Optional
-from dataclasses import dataclass, field
+from typing import Optional, List, Dict, Any
+from dataclasses import dataclass, field, asdict
 from pathlib import Path
 
+from .utils.common import get_iface
 from .constants import DEFAULT_CACHE_INTERVAL, DEFAULT_ANALYSIS_PORT, DEFAULT_RESOLVE_PORT
 
 
 @dataclass
 class TrafficConfig:
     """DNS Traffic Monitoring Configuration"""
-    interface: str = "any"
+    interface: Optional[str] = None
     pcap_dir: str = "pcap"
     pcap_rotation_size: int = 100  # MB
     pcap_rotation_time: int = 3600  # seconds
@@ -67,11 +69,10 @@ class TrafficConfig:
 @dataclass
 class ResolverConfig:
     """Resolver path monitoring configuration"""
-    interface: str = "any"
+    interface: Optional[str] = None
     client_ip: Optional[str] = None
     resolver_ip: Optional[str] = None
     timeout: int = 3
-    trace_queries: bool = True
     output_path: str = "resolve"
 
     enable_server: bool = False
@@ -85,7 +86,7 @@ class ResolverConfig:
 @dataclass
 class CacheCommonConfig:
     """Common fields for cache monitoring"""
-    interface: str = "any"
+    interface: Optional[str] = None
     resolver_ip: Optional[str] = None
     cooldown_period: float = .5
     timeout: float = 2.0
@@ -120,13 +121,14 @@ class CacheConfig:
 
 @dataclass
 class MonitorConfig:
-    """Main monitoring configuration"""
+    """Main monitoring configuration using dictionaries for named instances."""
     traffic: TrafficConfig = field(default_factory=TrafficConfig)
-    resolver: ResolverConfig = field(default_factory=ResolverConfig)
-    cache: CacheConfig = field(default_factory=CacheConfig)
+    resolvers: Dict[str, ResolverConfig] = field(default_factory=dict)
+    caches: Dict[str, CacheConfig] = field(default_factory=dict)
     log_level: str = "INFO"
     output_dir: str = "/tmp/dnsmonitor/output"
     log_file: Optional[str] = None
+    cidr: str = "10.0.0.0/24"
 
 
 class ConfigManager:
@@ -138,154 +140,101 @@ class ConfigManager:
         
         if config_file and Path(config_file).exists():
             self.load_from_file(config_file)
-        
-        # Override with environment variables
-        self.load_from_env()
-    
+
+    def _parse_cache_config(self, cache_data: Dict[str, Any]) -> CacheConfig:
+        """Helper to parse a single cache config dictionary."""
+        server_type = cache_data.get('server_type', 'bind')
+
+        # Handle common fields
+        common_fields = {f: cache_data[f] for f in CacheCommonConfig.__dataclass_fields__ if f in cache_data}
+        common_config = CacheCommonConfig(**common_fields)
+
+        # Handle BIND specific fields
+        bind_fields = {}
+        for f in BindCacheConfig.__dataclass_fields__:
+            if f in cache_data: bind_fields[f] = cache_data[f]
+        # Legacy compatibility
+        if 'bind_rndc_key' in cache_data: bind_fields['rndc_key_file'] = cache_data['bind_rndc_key']
+        if 'bind_dump_file' in cache_data: bind_fields['dump_file'] = cache_data['bind_dump_file']
+        bind_config = BindCacheConfig(**bind_fields)
+
+        # Handle Unbound specific fields
+        unbound_fields = {f: cache_data[f] for f in UnboundCacheConfig.__dataclass_fields__ if f in cache_data}
+        unbound_config = UnboundCacheConfig(**unbound_fields)
+
+        return CacheConfig(
+            server_type=server_type,
+            common=common_config,
+            bind=bind_config,
+            unbound=unbound_config
+        )
+
     def load_from_file(self, config_file: str) -> None:
-        """Load configuration from YAML file"""
+        """Load configuration from YAML file (now expecting dictionaries)."""
         try:
             with open(config_file, 'r', encoding='utf-8') as f:
                 data = yaml.safe_load(f) or {}
             
+            if 'cidr' in data:
+                self.config.cidr = data['cidr']
+            else:
+                raise ValueError("CIDR must be specified in the configuration file.")
+
+            _iface = get_iface(self.config.cidr)
+            if not _iface:
+                raise ValueError(f"Could not find interface for CIDR {self.config.cidr}")
+
             if 'traffic' in data:
                 self.config.traffic = TrafficConfig(**data['traffic'])
-            if 'resolver' in data:
-                self.config.resolver = ResolverConfig(**data['resolver'])
-            if 'cache' in data:
-                cache_data = data['cache']
-                
-                # Handle server_type
-                if 'server_type' in cache_data:
-                    self.config.cache.server_type = cache_data['server_type']
-                
-                # Handle common fields
-                common_fields = {}
-                for field in CacheCommonConfig.__dataclass_fields__:
-                    if field in cache_data:
-                        common_fields[field] = cache_data[field]
-                if common_fields:
-                    self.config.cache.common = CacheCommonConfig(**common_fields)
-                
-                # Handle BIND specific fields
-                bind_fields = {}
-                for field in BindCacheConfig.__dataclass_fields__:
-                    if field in cache_data:
-                        bind_fields[field] = cache_data[field]
-                    # Legacy field names compatibility
-                    elif field == 'rndc_key_file' and 'bind_rndc_key' in cache_data:
-                        bind_fields[field] = cache_data['bind_rndc_key']
-                    elif field == 'dump_file' and 'bind_dump_file' in cache_data:
-                        bind_fields[field] = cache_data['bind_dump_file']
-                if bind_fields:
-                    self.config.cache.bind = BindCacheConfig(**bind_fields)
-                
-                # Handle Unbound specific fields
-                unbound_fields = {}
-                for field in UnboundCacheConfig.__dataclass_fields__:
-                    if field in cache_data:
-                        unbound_fields[field] = cache_data[field]
-                if unbound_fields:
-                    self.config.cache.unbound = UnboundCacheConfig(**unbound_fields)
-            
-            if 'log_level' in data:
-                self.config.log_level = data['log_level']
-            if 'output_dir' in data:
-                self.config.output_dir = data['output_dir']
-            if 'log_file' in data:
-                self.config.log_file = data['log_file']
+                if self.config.traffic.interface is None:
+                    self.config.traffic.interface = _iface
+
+            if 'resolvers' in data and isinstance(data['resolvers'], dict):
+                self.config.resolvers = {
+                    name: ResolverConfig(**conf) for name, conf in data['resolvers'].items()
+                }
+                for resolver in self.config.resolvers.values():
+                    if resolver.interface is None:
+                        resolver.interface = _iface
+
+            if 'caches' in data and isinstance(data['caches'], dict):
+                self.config.caches = {
+                    name: self._parse_cache_config(conf) for name, conf in data['caches'].items()
+                }
+                for cache in self.config.caches.values():
+                    if cache.common.interface is None:
+                        cache.common.interface = _iface
+            if 'log_level' in data: self.config.log_level = data['log_level']
+            if 'output_dir' in data: self.config.output_dir = data['output_dir']
+            if 'log_file' in data: self.config.log_file = data['log_file']
                 
         except Exception as e:
             raise ValueError(f"Failed to load config from {config_file}: {e}")
     
-    def load_from_env(self) -> None:
-        """Load configuration from environment variables"""
-        # Traffic config
-        if os.getenv("DNS_MONITOR_INTERFACE"):
-            self.config.traffic.interface = os.getenv("DNS_MONITOR_INTERFACE")
-        if os.getenv("DNS_MONITOR_PCAP_DIR"):
-            self.config.traffic.pcap_dir = os.getenv("DNS_MONITOR_PCAP_DIR")
-        
-        # Resolver config
-        if os.getenv("CLIENT_IP"):
-            self.config.resolver.client_ip = os.getenv("CLIENT_IP")
-        if os.getenv("RESOLVER_IP"):
-            self.config.resolver.resolver_ip = os.getenv("RESOLVER_IP")
-        
-        # Cache config - server type
-        if os.getenv("DNS_SOFTWARE"):
-            self.config.cache.server_type = os.getenv("DNS_SOFTWARE")
-        
-        # Cache config - common fields
-        if os.getenv("CACHE_INTERFACE"):
-            self.config.cache.common.interface = os.getenv("CACHE_INTERFACE")
-        if os.getenv("CACHE_RESOLVER_IP"):
-            self.config.cache.common.resolver_ip = os.getenv("CACHE_RESOLVER_IP")
-        if os.getenv("CACHE_COOLDOWN_PERIOD"):
-            self.config.cache.common.cooldown_period = float(os.getenv("CACHE_COOLDOWN_PERIOD"))
-        if os.getenv("ENABLE_ANALYSIS_SERVER"):
-            self.config.cache.common.enable_analysis_server = os.getenv("ENABLE_ANALYSIS_SERVER").lower() in ('true', 'yes', '1')
-        if os.getenv("ANALYSIS_PORT"):
-            self.config.cache.common.analysis_port = int(os.getenv("ANALYSIS_PORT"))
-        if os.getenv("SAVE_CHANGES"):
-            self.config.cache.common.save_changes = os.getenv("SAVE_CHANGES").lower() in ('true', 'yes', '1')
-        
-        # Cache config - BIND specific
-        if os.getenv("BIND_RNDC_KEY"):
-            self.config.cache.bind.rndc_key_file = os.getenv("BIND_RNDC_KEY")
-        if os.getenv("BIND_DUMP_FILE"):
-            self.config.cache.bind.dump_file = os.getenv("BIND_DUMP_FILE")
-        
-        # Cache config - Unbound specific
-        if os.getenv("UNBOUND_CONTROL_CONFIG"):
-            self.config.cache.unbound.control_config = os.getenv("UNBOUND_CONTROL_CONFIG")
-        
-        # General config
-        if os.getenv("LOG_LEVEL"):
-            self.config.log_level = os.getenv("LOG_LEVEL")
-        if os.getenv("OUTPUT_DIR"):
-            self.config.output_dir = os.getenv("OUTPUT_DIR")
-        if os.getenv("LOG_FILE"):
-            self.config.log_file = os.getenv("LOG_FILE")
-    
     def save_to_file(self, config_file: str) -> None:
-        """Save current configuration to YAML file"""
+        """Save current configuration to YAML file with dictionary format."""
+        
+        # Helper to convert nested dataclasses for cache
+        def cache_to_dict(c: CacheConfig) -> dict:
+            data = asdict(c.common)
+            data['server_type'] = c.server_type
+            if c.server_type == 'bind':
+                data.update(asdict(c.bind))
+            elif c.server_type == 'unbound':
+                data.update(asdict(c.unbound))
+            return data
+
         config_dict = {
-            'traffic': {
-                'interface': self.config.traffic.interface,
-                'pcap_dir': self.config.traffic.pcap_dir,
-                'pcap_rotation_size': self.config.traffic.pcap_rotation_size,
-                'pcap_rotation_time': self.config.traffic.pcap_rotation_time,
-                'bpf_filter': self.config.traffic.bpf_filter,
-                'buffer_size': self.config.traffic.buffer_size,
-            },
-            'resolver': {
-                'client_ip': self.config.resolver.client_ip,
-                'resolver_ip': self.config.resolver.resolver_ip,
-                'timeout': self.config.resolver.timeout,
-                'bpf_filter': self.config.resolver.bpf_filter,
-                'trace_queries': self.config.resolver.trace_queries,
-            },
-            'cache': {
-                'server_type': self.config.cache.server_type,
-                # Common fields
-                'interval': self.config.cache.common.interval,
-                'enable_analysis_server': self.config.cache.common.enable_analysis_server,
-                'analysis_port': self.config.cache.common.analysis_port,
-                'save_changes': self.config.cache.common.save_changes,
-                # BIND specific fields
-                'rndc_key_file': self.config.cache.bind.rndc_key_file,
-                'dump_file': self.config.cache.bind.dump_file,
-                # Unbound specific fields
-                'control_config': self.config.cache.unbound.control_config,
-            },
+            'traffic': asdict(self.config.traffic),
+            'resolvers': {name: asdict(conf) for name, conf in self.config.resolvers.items()},
+            'caches': {name: cache_to_dict(conf) for name, conf in self.config.caches.items()},
             'log_level': self.config.log_level,
             'output_dir': self.config.output_dir,
             'log_file': self.config.log_file,
         }
         
         with open(config_file, 'w', encoding='utf-8') as f:
-            yaml.dump(config_dict, f, default_flow_style=False, allow_unicode=True)
+            yaml.dump(config_dict, f, default_flow_style=False, allow_unicode=True, sort_keys=False)
     
     def get_config(self) -> MonitorConfig:
         """Get the current configuration"""
