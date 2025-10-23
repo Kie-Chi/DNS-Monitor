@@ -126,14 +126,19 @@ class CacheDiff:
         common_keys = set(old_map.keys()) & set(new_map.keys())
         added_pkts = []
         removed_pkts = []
+        _escape_time = self.new_snapshot.timestamp - self.old_snapshot.timestamp
+        _eps = 1.5
         for key in common_keys:
             old_rec = old_map[key]
             new_rec = new_map[key]
             # If TTL has decreased, it's a modification
-            if new_rec.ttl > old_rec.ttl:
+            _ideal = old_rec.ttl - _escape_time
+            if new_rec.ttl >= _ideal + _eps:
                 self.modified_records.append({
                     'old': old_rec.to_dict(),
                     'new': new_rec.to_dict(),
+                    'ideal': _ideal,
+                    'actual': new_rec.ttl,
                 })
                 added_pkts.append(new_rec)
                 removed_pkts.append(old_rec)
@@ -179,8 +184,8 @@ class AbstractCacheMonitor(ABC):
 class BindCacheMonitor(AbstractCacheMonitor):
     def __init__(self, config: CacheConfig):
         super().__init__(config)
-        self.rndc_key_file = config.bind.rndc_key_file or "/usr/local/var/bind/rndc.key"
-        self.dump_file = config.bind.dump_file or "/usr/local/var/bind/named_dump.db"
+        self.rndc_key_file = config.bind.rndc_key_file
+        self.dump_file = config.bind.dump_file
     
     def dump_cache(self) -> str:
         # Simplified dump logic for brevity, original logic is also fine
@@ -308,7 +313,7 @@ class UnboundCacheMonitor(AbstractCacheMonitor):
         try:
             cmd = ["unbound-control", "dump_cache"]
             if self.config.unbound.control_config:
-                cmd = ["unbound-control", "-c", self.config.unbound.control_config, "dump_cache"]
+                cmd = ["unbound-control", "-s", self.config.common.resolver_ip, "-c", self.config.unbound.control_config, "dump_cache"]
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
             if result.returncode != 0:
                 self.logger.error(f"unbound-control dump failed: {result.stderr}")
@@ -320,18 +325,55 @@ class UnboundCacheMonitor(AbstractCacheMonitor):
     
     def parse_cache(self, cache_data: str, trigger: Optional[DNSPacket]) -> CacheSnapshot:
         snapshot = CacheSnapshot(trigger=trigger)
-        for line in cache_data.strip().split('\n'):
-            if line.startswith("msg") or "validation" in line or not line:
+        self.logger.debug("Starting robust parse of Unbound cache dump.")
+
+        in_rrset_cache = False
+        for line in cache_data.splitlines():
+            line = line.strip()
+
+            # Process only lines within the RRset cache section.
+            if line.startswith("START_RRSET_CACHE"):
+                in_rrset_cache = True
                 continue
+            if line.startswith("END_RRSET_CACHE"):
+                break  # We are done with the relevant section
+            if not in_rrset_cache or line.startswith(";") or not line:
+                continue
+
             parts = line.split()
-            if len(parts) >= 5 and parts[3].isdigit():
-                name, rtype, _, ttl, *rdata_parts = parts
-                rdata = ' '.join(rdata_parts)
-                record = DNSCacheRecord(name, rtype, rdata, int(ttl))
+            if len(parts) < 5 or parts[2].upper() != "IN":
+                self.logger.debug(f"Skipping malformed cache line: {line}")
+                continue
+            domain_str, ttl_str, _, rdtype_str, *value_parts = parts
+            value_str = " ".join(value_parts)
+            try:
+                ttl = int(ttl_str)
+                domain = dns_name.from_text(domain_str)
+                rdtype_obj = rdatatype.from_text(rdtype_str)
+                try:
+                    rdata_obj = rdata.from_text(1, rdtype_obj, value_str, origin=domain)
+                    normalized_rdata = rdata_obj.to_text()
+                except dns_exception.DNSException:
+                    self.logger.debug(
+                        f"dnspython failed to parse rdata for '{line}', using raw value."
+                    )
+                    normalized_rdata = value_str
+
+                record = DNSCacheRecord(
+                    name=domain.to_text(omit_final_dot=True),
+                    rtype=rdatatype.to_text(rdtype_obj),
+                    rdata=normalized_rdata,
+                    ttl=ttl,
+                    is_neg=False
+                )
                 snapshot.add_record(record)
+            except (ValueError, dns_exception.DNSException) as e:
+                self.logger.debug(f"Skipping line due to parsing error: '{line}'. Error: {e}")
+                continue
+        record_count = snapshot.record_cnts()
+        self.logger.info(f"Parsed {record_count} records from Unbound cache.")
         return snapshot
 
-# REFACTORED: CacheAnalysisServer now retrieves latest data instead of triggering analysis
 class CacheAnalysisServer(socketserver.ThreadingTCPServer):
     def __init__(self, server_address, RequestHandlerClass, monitor: 'CacheMonitor') -> None:
         super().__init__(server_address, RequestHandlerClass)
@@ -538,6 +580,9 @@ class CacheMonitor:
                         if diff.has_changes():
                             self.last_diff = diff
                             self.print(diff)
+                        else:
+                            self.last_diff = None
+                            self.logger.info("No cache changes detected.")
                     self.current_snapshot = new_snapshot
 
             except queue.Empty:

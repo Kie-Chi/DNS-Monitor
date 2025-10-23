@@ -99,14 +99,14 @@ class CacheCommonConfig:
 @dataclass
 class BindCacheConfig:
     """BIND-specific cache configuration"""
-    rndc_key_file: Optional[str] = None  # e.g., "/etc/bind/rndc.key"
-    dump_file: Optional[str] = None      # e.g., "/var/cache/bind/named_dump.db"
+    rndc_key_file: str = "/usr/local/var/bind/rndc.key"
+    dump_file: str = "/usr/local/var/bind/named_dump.db"
 
 
 @dataclass
 class UnboundCacheConfig:
     """Unbound-specific cache configuration"""
-    control_config: Optional[str] = None  # Optional path to unbound-control config
+    control_config: str = "/usr/local/var/unbound/control.conf"
 
 
 @dataclass
