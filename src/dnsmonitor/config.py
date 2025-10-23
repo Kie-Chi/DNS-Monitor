@@ -10,8 +10,10 @@ from dataclasses import dataclass, field, asdict
 from pathlib import Path
 
 from .utils.common import get_iface
-from .constants import DEFAULT_CACHE_INTERVAL, DEFAULT_ANALYSIS_PORT, DEFAULT_RESOLVE_PORT
+from .constants import DEFAULT_ANALYSIS_PORT, DEFAULT_RESOLVE_PORT, DEFAULT_MONITOR_PORT
+from .utils.logger import get_logger
 
+logger = get_logger(__name__)
 
 @dataclass
 class TrafficConfig:
@@ -118,6 +120,12 @@ class CacheConfig:
     bind: BindCacheConfig = field(default_factory=BindCacheConfig)
     unbound: UnboundCacheConfig = field(default_factory=UnboundCacheConfig)
 
+@dataclass
+class ServerConfig:
+    """Configuration for the main DNSMonitor aggregator server"""
+    enable: bool = True
+    address: str = "0.0.0.0"
+    port: int = DEFAULT_MONITOR_PORT
 
 @dataclass
 class MonitorConfig:
@@ -125,6 +133,7 @@ class MonitorConfig:
     traffic: TrafficConfig = field(default_factory=TrafficConfig)
     resolvers: Dict[str, ResolverConfig] = field(default_factory=dict)
     caches: Dict[str, CacheConfig] = field(default_factory=dict)
+    server: ServerConfig = field(default_factory=ServerConfig)
     log_level: str = "INFO"
     output_dir: str = "/tmp/dnsmonitor/output"
     log_file: Optional[str] = None
@@ -138,6 +147,31 @@ class ConfigManager:
         self.config_file = config_file
         self.config = MonitorConfig()
         
+        if config_file:
+            if Path(config_file).exists():
+                self.load_from_file(config_file)
+            else:
+                raise FileNotFoundError(f"Configuration file not found: {config_file}")
+        else:
+            default_paths = [
+                'dnsmonitor_config.yaml',
+                'config.yaml',
+                '/usr/local/etc/dnsm.yaml',
+                '/etc/dnsm.yaml',
+                '/usr/local/etc/dnsm.yml',
+                '/etc/dnsm.yml',
+            ]
+            found_path = None
+            for path in default_paths:
+                if Path(path).exists():
+                    found_path = path
+                    break
+            if found_path:
+                logger.info(f"No config file specified. Found and using default: '{found_path}'")
+                self.load_from_file(found_path)
+            else:
+                logger.warning("No configuration file specified or found. Using default empty configuration.")
+
         if config_file and Path(config_file).exists():
             self.load_from_file(config_file)
 
@@ -204,6 +238,7 @@ class ConfigManager:
                 for cache in self.config.caches.values():
                     if cache.common.interface is None:
                         cache.common.interface = _iface
+            if 'server' in data: self.config.server = ServerConfig(**data['server'])
             if 'log_level' in data: self.config.log_level = data['log_level']
             if 'output_dir' in data: self.config.output_dir = data['output_dir']
             if 'log_file' in data: self.config.log_file = data['log_file']
@@ -228,6 +263,7 @@ class ConfigManager:
             'traffic': asdict(self.config.traffic),
             'resolvers': {name: asdict(conf) for name, conf in self.config.resolvers.items()},
             'caches': {name: cache_to_dict(conf) for name, conf in self.config.caches.items()},
+            'server': asdict(self.config.server),
             'log_level': self.config.log_level,
             'output_dir': self.config.output_dir,
             'log_file': self.config.log_file,

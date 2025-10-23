@@ -281,6 +281,11 @@ class ResolvHandler(socketserver.BaseRequestHandler):
                             "status": "success",
                             "transaction": self.server.monitor.trans[pos].to_dict()
                         }
+                    elif pos == -1:
+                        resp = {
+                            "status": "success",
+                            "transaction": self.server.monitor.trans[-1].to_dict()
+                        }
                     else:
                         resp = {
                             "status": "error",

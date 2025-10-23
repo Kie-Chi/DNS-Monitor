@@ -15,8 +15,8 @@ from .utils import print_header, print_info, print_error, Colors
 
 
 @click.group()
-@click.option('--config', '-c', type=click.Path(exists=True), 
-              help='Configuration file path')
+@click.option('--config', '-c', type=click.Path(), 
+              help='Configuration file path. Defaults to dnsmonitor_config.yaml in the current directory.')
 @click.option('--log-level', '-l', type=click.Choice(['DEBUG', 'INFO', 'WARNING', 'ERROR']),
               default='INFO', help='Log level')
 @click.option('--log-file', type=click.Path(), help='Log file path')
@@ -24,66 +24,65 @@ from .utils import print_header, print_info, print_error, Colors
 def cli(ctx, config: Optional[str], log_level: str, log_file: Optional[str]):
     """DNS Monitor - Comprehensive DNS monitoring tool"""
     ctx.ensure_object(dict)
-    
-    # Setup logging
     setup_logger(
         debug=(log_level.upper() == 'DEBUG'),
         log_file=log_file
     )
     logger = get_logger(__name__)
     ctx.obj['logger'] = logger
-    
-    # Load configuration
     try:
         config_manager = ConfigManager(config)
         ctx.obj['config_manager'] = config_manager
         ctx.obj['config'] = config_manager.get_config()
-        # override log level if provided
-        ctx.obj['config'].log_level = log_level
-        ctx.obj['config'].log_file = log_file if log_file else None
+        if log_level:
+            ctx.obj['config'].log_level = log_level
+        if log_file:
+            ctx.obj['config'].log_file = log_file
     except Exception as e:
         print_error(f"Failed to load configuration: {e}")
         sys.exit(1)
 
 
 @cli.command()
-@click.option('--interface', '-i', help='Network interface to monitor')
-@click.option('--client-ip', help='Client IP address to monitor')
-@click.option('--resolver-ip', help='Resolver IP address to monitor')
-@click.option('--cache-software', type=click.Choice(['bind', 'unbound']),
-              help='DNS cache software type')
-@click.option('--output-dir', '-o', help='Output directory for results')
 @click.pass_context
-def monitor(ctx, interface: Optional[str], client_ip: Optional[str], resolver_ip: Optional[str], cache_software: Optional[str], output_dir: Optional[str]):
-    """Start comprehensive DNS monitoring"""
+def monitor(ctx):
+    """Start comprehensive DNS monitoring based on the configuration file."""
     config = ctx.obj['config']
     logger = ctx.obj['logger']
     
-    # Override config with command line options
-    if interface:
-        config.traffic.interface = interface
-    if client_ip:
-        config.resolver.client_ip = client_ip
-    if resolver_ip:
-        config.resolver.resolver_ip = resolver_ip
-    if cache_software:
-        config.cache.server_type = cache_software
-        config.cache.software = cache_software
-    if output_dir:
-        config.output_dir = output_dir
-    
     print_header("DNS Monitor Starting")
-    print_info(f"Interface: {config.traffic.interface}")
-    print_info(f"Client IP: {config.resolver.client_ip}")
-    print_info(f"Resolver IP: {config.resolver.resolver_ip}")
-    print_info(f"Cache Software: {config.cache.software}")
-    print_info(f"Output Directory: {config.output_dir}")
-    
+    if not config.caches and not config.resolvers:
+        print_error("Configuration is empty. No cache or resolver monitors to start.")
+        print_info("Please create a 'dnsmonitor_config.yaml' file or specify one with '-c'.")
+        sys.exit(1)
+
+    print_info(f"Log Level: {config.log_level}")
+    if config.log_file:
+        print_info(f"Log File: {config.log_file}")
+
+    if config.traffic:
+        print_info("Traffic Monitors to be started:")
+        print_info(f" => [{config.traffic.interface}] BPF Filter: {config.traffic.bpf_filter}")
+
+    if config.caches:
+        print_info("Cache Monitors to be started:")
+        for name, cache_conf in config.caches.items():
+            print_info(f" => [{name}] Type: {cache_conf.server_type.upper()}, Resolver: {cache_conf.common.resolver_ip}")
+
+    if config.resolvers:
+        print_info("Resolver Monitors to be started:")
+        for name, res_conf in config.resolvers.items():
+            print_info(f" => [{name}] Client: {res_conf.client_ip}, Resolver: {res_conf.resolver_ip}")
+
+    if config.server.enable:
+        addr = f"{config.server.address}:{config.server.port}"
+        print_info(f"Aggregator server will listen on: {addr}")
+
     try:
-        monitor = DNSMonitor(config)
-        monitor.start()
+        monitor_service = DNSMonitor(config)
+        monitor_service.start()
     except KeyboardInterrupt:
-        print_info("Monitoring stopped by user")
+        print_info("\nMonitoring stopped by user")
     except Exception as e:
         print_error(f"Monitoring failed: {e}")
         logger.exception("Monitoring error")
