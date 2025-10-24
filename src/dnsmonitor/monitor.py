@@ -59,15 +59,15 @@ class DNSMonitorRequestHandler(socketserver.BaseRequestHandler):
         monitor = self.server.monitor
         response = {}
         for name, config in monitor.cache_configs.items():
-            if config.common.enable_analysis_server:
+            if config.common.enale_server:
                 addr = config.common.analysis_address
                 port = config.common.analysis_port
-                response[name] = self._query_child(addr, port)
+                response[f"cache:{name}"] = self._query_child(addr, port)
         for name, config in monitor.resolver_configs.items():
             if config.enable_server:
                 addr = config.analysis_address
                 port = config.analysis_port
-                response[name] = self._query_child(addr, port, command="-1")
+                response[f"resolver:{name}"] = self._query_child(addr, port, command="-1")
         
         self.request.sendall(json.dumps(response, indent=2).encode('utf-8'))
 

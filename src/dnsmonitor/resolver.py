@@ -415,7 +415,7 @@ class ResolverMonitor:
 
     def _server_worker(self):
         try:
-            host, port = "0.0.0.0", self.config.analysis_port
+            host, port = self.config.analysis_address, self.config.analysis_port
             self.analysis_server = AnalysisServer((host, port), ResolvHandler, self)
             
             self.logger.info(f"Starting analysis server on {host}:{port}")

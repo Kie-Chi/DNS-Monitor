@@ -77,7 +77,8 @@ class ResolverConfig:
     timeout: int = 3
     output_path: str = "resolve"
 
-    enable_server: bool = False
+    enable_server: bool = True
+    analysis_address: str = "0.0.0.0"
     analysis_port: int = DEFAULT_RESOLVE_PORT
 
 
@@ -92,7 +93,7 @@ class CacheCommonConfig:
     resolver_ip: Optional[str] = None
     cooldown_period: float = .5
     timeout: float = 2.0
-    enable_analysis_server: bool = False
+    enale_server: bool = True
     analysis_address: str = "0.0.0.0"
     analysis_port: int = DEFAULT_ANALYSIS_PORT
     save_changes: bool = True

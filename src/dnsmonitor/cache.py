@@ -459,7 +459,7 @@ class CacheMonitor:
 
     # Initialization and thread management methods
     def _setup_server(self):
-        if self.config.common.enable_analysis_server:
+        if self.config.common.enale_server:
             addr = (self.config.common.analysis_address, self.config.common.analysis_port)
             return CacheAnalysisServer(addr, CacheRequestHandler, self)
         return None
