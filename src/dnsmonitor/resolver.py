@@ -269,36 +269,55 @@ class AnalysisServer(socketserver.ThreadingTCPServer):
 
 class ResolvHandler(socketserver.BaseRequestHandler):
     def handle(self) -> None:
+        resp = {}
         try:
             data = self.request.recv(1024).strip()
-            self.server.monitor.logger.info(f"Recv request from {self.client_address}: {data}")
-            resp = {}
-            try:
-                pos = int(data)
-                with self.server.monitor.trans_lock:
-                    if 0 <= pos < len(self.server.monitor.trans):
-                        resp = {
-                            "status": "success",
-                            "transaction": self.server.monitor.trans[pos].to_dict()
-                        }
-                    elif pos == -1:
-                        resp = {
-                            "status": "success",
-                            "transaction": self.server.monitor.trans[-1].to_dict()
-                        }
-                    else:
-                        resp = {
-                            "status": "error",
-                            "message": f"Transaction {pos} not found"
-                        }
-            except (ValueError, TypeError) as e:
+            if not data:
                 resp = {
                     "status": "error",
-                    "message": str(e)
+                    "message": "No data received"
                 }
-            self.request.sendall(json.dumps(resp, indent=2).encode())
+            else:
+                self.server.monitor.logger.info(f"Recv request from {self.client_address}: {data}")
+                try:
+                    pos = int(data)
+                    with self.server.monitor.trans_lock:
+                        if len(self.server.monitor.trans) == 0:
+                            resp = {
+                                "status": "error",
+                                "message": "No transactions available yet"
+                            }
+                        elif 0 <= pos < len(self.server.monitor.trans):
+                            resp = {
+                                "status": "success",
+                                "transaction": self.server.monitor.trans[pos].to_dict()
+                            }
+                        elif pos == -1:
+                            resp = {
+                                "status": "success",
+                                "transaction": self.server.monitor.trans[-1].to_dict()
+                            }
+                        else:
+                            resp = {
+                                "status": "error",
+                                "message": f"Transaction {pos} not found"
+                            }
+                except (ValueError, TypeError) as e:
+                    resp = {
+                        "status": "error",
+                        "message": str(e)
+                    }
         except Exception as e:
             self.server.monitor.logger.error(f"Error handling request: {e}")
+            resp = {
+                "status": "error",
+                "message": f"Failed to process request: {str(e)}"
+            }
+        finally:
+            try:
+                self.request.sendall(json.dumps(resp, indent=2).encode())
+            except Exception as send_err:
+                self.server.monitor.logger.error(f"Failed to send response: {send_err}")
 
 class ResolverMonitor:
     """

@@ -39,21 +39,36 @@ class DNSMonitorRequestHandler(socketserver.BaseRequestHandler):
     def _query_child(self, address: str, port: int, command: str = "") -> Dict[str, Any]:
         """Helper to query a child monitor's analysis server."""
         try:
-            with socket.create_connection((address, port), timeout=2) as s:
+            with socket.create_connection((address, port), timeout=3) as s:
+                # Send command with newline to signal end of input
                 if command:
-                    s.sendall(command.encode('utf-8'))
+                    s.sendall((command + "\n").encode('utf-8'))
+                else:
+                    s.sendall(b"\n")  # Send empty command with newline
 
                 response_data = b""
-                while True:
-                    chunk = s.recv(4096)
-                    if not chunk:
-                        break
-                    response_data += chunk
+                # Set a timeout for receiving data
+                s.settimeout(3)
+                try:
+                    while True:
+                        chunk = s.recv(4096)
+                        if not chunk:
+                            break
+                        response_data += chunk
+                except socket.timeout:
+                    # Timeout while receiving is acceptable; process what we got
+                    pass
+                
+                if not response_data:
+                    return {"status": "error", "message": f"No response from {address}:{port}"}
+                
                 return json.loads(response_data)
-        except (socket.timeout, ConnectionRefusedError, json.JSONDecodeError) as e:
-            return {"status": "error", "message": f"Failed to query child at {address}:{port}: {str(e)}"}
+        except (socket.timeout, ConnectionRefusedError) as e:
+            return {"status": "error", "message": f"Failed to query child at {address}:{port}: {type(e).__name__}"}
+        except json.JSONDecodeError as e:
+            return {"status": "error", "message": f"Invalid JSON response from {address}:{port}: {str(e)}"}
         except Exception as e:
-            return {"status": "error", "message": f"An unexpected error occurred: {str(e)}"}
+            return {"status": "error", "message": f"Unexpected error querying {address}:{port}: {str(e)}"}
 
     def handle(self) -> None:
         monitor = self.server.monitor
