@@ -381,6 +381,7 @@ class CacheAnalysisServer(socketserver.ThreadingTCPServer):
 
 class CacheRequestHandler(socketserver.BaseRequestHandler):
     def handle(self) -> None:
+        response = {}
         try:
             with self.server.monitor.lock:
                 latest_diff = self.server.monitor.last_diff
@@ -403,12 +404,17 @@ class CacheRequestHandler(socketserver.BaseRequestHandler):
                     "status": "error",
                     "message": "No snapshot available yet."
                 }
-
-            self.request.sendall(json.dumps(response, indent=2).encode('utf-8'))
         except Exception as e:
             self.server.monitor.logger.error(f"Error handling client request: {e}")
+            response = {
+                "status": "error",
+                "message": f"Failed to process request: {str(e)}"
+            }
         finally:
-            self.request.close()
+            try:
+                self.request.sendall(json.dumps(response, indent=2).encode('utf-8'))
+            except Exception as send_err:
+                self.server.monitor.logger.error(f"Failed to send response: {send_err}")
 
 
 class CacheMonitor:
