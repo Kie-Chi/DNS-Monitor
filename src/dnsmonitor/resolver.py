@@ -613,12 +613,12 @@ class ResolverMonitor:
     def _print_summary(self, t: DNSTransaction):
         """Logs a one-line summary of a processed transaction."""
         summary_str = TransactionAnalyzer.print(t)
-        print(f"\n{'-'*80}\n{summary_str}\n{'-'*80}")
+        self.logger.info(f"\n{'-'*80}\n{summary_str}\n{'-'*80}")
 
     def _print_info(self):
-        print(f"\n{Colors.BOLD}{Colors.CYAN}DNS Resolver Path Monitor{Colors.RESET}")
-        print(f"{Colors.CYAN}{'='*60}{Colors.RESET}")
-        print(f"Client IP: {colorize(self.config.client_ip, Colors.GREEN)}")
-        print(f"Resolver IP: {colorize(self.config.resolver_ip, Colors.GREEN)}")
-        print(f"Mode: {colorize('One transaction at a time', Colors.YELLOW)}")
-        print(f"{Colors.CYAN}{'='*60}{Colors.RESET}\n")
+        self.logger.info(f"\n{Colors.BOLD}{Colors.CYAN}DNS Resolver Path Monitor{Colors.RESET}")
+        self.logger.info(f"{Colors.CYAN}{'='*60}{Colors.RESET}")
+        self.logger.info(f"Client IP: {colorize(self.config.client_ip, Colors.GREEN)}")
+        self.logger.info(f"Resolver IP: {colorize(self.config.resolver_ip, Colors.GREEN)}")
+        self.logger.info(f"Mode: {colorize('One transaction at a time', Colors.YELLOW)}")
+        self.logger.info(f"{Colors.CYAN}{'='*60}{Colors.RESET}\n")
