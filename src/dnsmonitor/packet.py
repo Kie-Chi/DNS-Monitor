@@ -87,7 +87,10 @@ class DNSPacket:
         if self._dpkt_dns is None:
             try:
                 self._dpkt_dns = dpkt.dns.DNS(self._dns_data)
-            except Exception:
+            except Exception as e:
+                # Log parsing errors for debugging
+                import sys
+                print(f"[DEBUG] DNS parsing failed: {e}, data length: {len(self._dns_data)}", file=sys.stderr)
                 return None
         return self._dpkt_dns
     
@@ -326,6 +329,12 @@ class DNSPacket:
     def get_answers_list(self) -> List[Dict[str, Any]]:
         """Get answers as list of dictionaries (cached)"""
         if self._answers_cache is None:
+            dns = self.dpkt_dns
+            if dns:
+                # Debug: check if dpkt parsed the sections
+                import sys
+                print(f"[DEBUG] DNS object - qr={dns.qr}, opcode={dns.opcode}, rcode={dns.rcode}", file=sys.stderr)
+                print(f"[DEBUG] Counts - qd={len(dns.qd) if dns.qd else 0}, an={len(dns.an) if dns.an else 0}, ns={len(dns.ns) if dns.ns else 0}, ar={len(dns.ar) if dns.ar else 0}", file=sys.stderr)
             self._answers_cache = [self.get_rr_dict(rr) for rr in self.answers]
         return self._answers_cache
 
