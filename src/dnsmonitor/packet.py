@@ -67,6 +67,11 @@ class DNSPacket:
     # Lightweight caches (only for frequently accessed data)
     _qname_cache: Optional[str] = field(default=None, init=False, repr=False)
     _qtype_cache: Optional[str] = field(default=None, init=False, repr=False)
+    
+    # Cache for parsed RR lists (to avoid re-parsing)
+    _answers_cache: Optional[List[Dict[str, Any]]] = field(default=None, init=False, repr=False)
+    _authorities_cache: Optional[List[Dict[str, Any]]] = field(default=None, init=False, repr=False)
+    _additionals_cache: Optional[List[Dict[str, Any]]] = field(default=None, init=False, repr=False)
 
     def _format_name(self, name_field: Union[str, bytes]) -> str:
         """Decodes bytes to string and formats the root domain correctly."""
@@ -319,15 +324,22 @@ class DNSPacket:
         return [self.get_question_dict(q) for q in self.questions]
 
     def get_answers_list(self) -> List[Dict[str, Any]]:
-        """Get answers as list of dictionaries"""
-        return [self.get_rr_dict(rr) for rr in self.answers]
+        """Get answers as list of dictionaries (cached)"""
+        if self._answers_cache is None:
+            self._answers_cache = [self.get_rr_dict(rr) for rr in self.answers]
+        return self._answers_cache
 
     def get_authorities_list(self) -> List[Dict[str, Any]]:
-        """Get authorities as list of dictionaries"""
-        return [self.get_rr_dict(rr) for rr in self.authorities]
+        """Get authorities as list of dictionaries (cached)"""
+        if self._authorities_cache is None:
+            self._authorities_cache = [self.get_rr_dict(rr) for rr in self.authorities]
+        return self._authorities_cache
 
     def get_additionals_list(self) -> List[Dict[str, Any]]:
-        """Get additionals as list of dictionaries"""
+        """Get additionals as list of dictionaries (cached)"""
+        if self._additionals_cache is None:
+            self._additionals_cache = [self.get_rr_dict(rr) for rr in self.additionals]
+        return self._additionals_cache
         return [self.get_rr_dict(rr) for rr in self.additionals]
 
     def _get_qtype_name(self, qtype: int) -> str:
