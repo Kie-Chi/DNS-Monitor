@@ -674,6 +674,7 @@ class ResolverMonitor:
         """Collects all packets until the final response or a timeout occurs."""
         collected = [initial_query]
         transaction_start_time = time.time()
+        timed_out = False
         
         while self.running.is_set():
             time_elapsed = time.time() - transaction_start_time
@@ -682,6 +683,7 @@ class ResolverMonitor:
             if remaining_time <= 0:
                 self.logger.warning(f"Transaction for {initial_query.qname} timed out.")
                 self.stats['timeout_trans'] += 1
+                timed_out = True
                 break
                 
             try:
@@ -700,33 +702,48 @@ class ResolverMonitor:
             except queue.Empty:
                 self.logger.warning(f"Transaction for {initial_query.qname} timed out while waiting for packets.")
                 self.stats['timeout_trans'] += 1
+                timed_out = True
                 break
         
-        # After timeout, try to collect any remaining packets that may have just arrived
-        # This ensures we capture queries that were sent right before timeout
-        grace_period = 0.1  # 100ms grace period
-        grace_deadline = time.time() + grace_period
-        while time.time() < grace_deadline:
-            try:
-                packet = self.packet_queue.get(timeout=0.05)
-                if packet is None:
-                    break
-                collected.append(packet)
-                self.logger.debug(f"Collected packet during grace period: {packet.qname}")
-                
-                # Check if we got the final response during grace period
-                if (packet.is_response and
-                    packet.src_ip == self.config.resolver_ip and
-                    packet.dst_ip == self.config.client_ip and
-                    packet.query_id == initial_query.query_id):
-                    self.logger.info("Final response received during grace period. Transaction captured.")
-                    self.stats['trans'] += 1
-                    # Update timeout_trans counter since we did get a response
-                    if 'timeout_trans' in self.stats and self.stats['timeout_trans'] > 0:
-                        self.stats['timeout_trans'] -= 1
-                    break
-            except queue.Empty:
-                break
+        # After timeout, use a grace period to collect remaining packets
+        if timed_out:
+            grace_period = 0.2  # 200ms grace period
+            grace_deadline = time.time() + grace_period
+            self.logger.debug(f"Entering grace period to collect straggler packets...")
+            
+            while time.time() < grace_deadline:
+                try:
+                    packet = self.packet_queue.get(timeout=0.05)
+                    if packet is None:
+                        break
+                    
+                    # Collect packets that are part of THIS transaction
+                    # Include: outgoing queries from resolver, and responses to resolver
+                    is_resolver_query = (not packet.is_response and 
+                                        packet.src_ip == self.config.resolver_ip)
+                    is_resolver_response = (packet.is_response and 
+                                          packet.dst_ip == self.config.resolver_ip)
+                    
+                    if is_resolver_query or is_resolver_response:
+                        collected.append(packet)
+                        self.logger.debug(f"Collected packet during grace period: "
+                                        f"{'Query' if not packet.is_response else 'Response'} "
+                                        f"{packet.qtype}? {packet.qname} "
+                                        f"({packet.src_ip}->{packet.dst_ip})")
+                    
+                    # Check if we got the final response during grace period
+                    if (packet.is_response and
+                        packet.src_ip == self.config.resolver_ip and
+                        packet.dst_ip == self.config.client_ip and
+                        packet.query_id == initial_query.query_id):
+                        self.logger.info("Final response received during grace period. Transaction captured.")
+                        self.stats['trans'] += 1
+                        # Update timeout_trans counter since we did get a response
+                        if self.stats['timeout_trans'] > 0:
+                            self.stats['timeout_trans'] -= 1
+                        break
+                except queue.Empty:
+                    continue  # Keep trying until grace period expires
         
         return collected
 
