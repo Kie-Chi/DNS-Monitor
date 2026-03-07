@@ -220,6 +220,12 @@ class TransactionAnalyzer:
         rcode_name = RCODE_MAP.get(packet.rcode, f"RCODE{packet.rcode}")
         lines.append(f"    RCODE: {rcode_name}")
         
+        # Always show counts
+        ans_count = len(answers) if answers else 0
+        auth_count = len(authorities) if authorities else 0
+        add_count = len(additionals) if additionals else 0
+        lines.append(f"    Counts: AN={ans_count} NS={auth_count} AR={add_count}")
+        
         if answers:
             lines.append(f"    Answers ({len(answers)}):")
             for ans in answers:
@@ -237,6 +243,13 @@ class TransactionAnalyzer:
                         lines.append(f"      {name} {ttl} IN {type_str} {rdata.get('preference', '')} {rdata.get('exchange', '')}")
                     elif type_str == 'NS':
                         lines.append(f"      {name} {ttl} IN {type_str} {rdata.get('nsname', 'N/A')}")
+                    elif type_str == 'PTR':
+                        lines.append(f"      {name} {ttl} IN {type_str} {rdata.get('ptrname', 'N/A')}")
+                    elif type_str == 'SOA':
+                        mname = rdata.get('mname', '')
+                        rname = rdata.get('rname', '')
+                        serial = rdata.get('serial', '')
+                        lines.append(f"      {name} {ttl} IN {type_str} {mname} {rname} {serial} ...")
                     elif type_str == 'TXT':
                         lines.append(f"      {name} {ttl} IN {type_str} \"{rdata.get('text', '')}\"")
                     elif type_str in ['DS', 'DNSKEY', 'RRSIG', 'NSEC', 'NSEC3', 'TLSA', 'CAA']:
@@ -255,8 +268,23 @@ class TransactionAnalyzer:
                 ttl = auth.get('ttl', 0)
                 rdata = auth.get('rdata', {})
                 
-                if isinstance(rdata, dict) and type_str == 'NS':
-                    lines.append(f"      {name} {ttl} IN {type_str} {rdata.get('nsname', 'N/A')}")
+                if isinstance(rdata, dict):
+                    if type_str == 'NS':
+                        lines.append(f"      {name} {ttl} IN {type_str} {rdata.get('nsname', 'N/A')}")
+                    elif type_str == 'SOA':
+                        mname = rdata.get('mname', '')
+                        rname = rdata.get('rname', '')
+                        serial = rdata.get('serial', '')
+                        refresh = rdata.get('refresh', '')
+                        retry = rdata.get('retry', '')
+                        expire = rdata.get('expire', '')
+                        minimum = rdata.get('minimum', '')
+                        lines.append(f"      {name} {ttl} IN {type_str} {mname} {rname} {serial} {refresh} {retry} {expire} {minimum}")
+                    elif type_str in ['DS', 'RRSIG', 'NSEC', 'NSEC3']:
+                        rdata_str = ' '.join(f'{k}={v}' for k, v in rdata.items() if v)
+                        lines.append(f"      {name} {ttl} IN {type_str} {rdata_str}")
+                    else:
+                        lines.append(f"      {name} {ttl} IN {type_str} {rdata}")
                 else:
                     lines.append(f"      {name} {ttl} IN {type_str} {rdata}")
         
@@ -268,9 +296,26 @@ class TransactionAnalyzer:
                 ttl = add.get('ttl', 0)
                 rdata = add.get('rdata', {})
                 
-                if isinstance(rdata, dict) and type_str in ['A', 'AAAA']:
-                    lines.append(f"      {name} {ttl} IN {type_str} {rdata.get('address', 'N/A')}")
-                elif type_str != 'OPT':  # Skip OPT records
+                # Skip OPT pseudo-record (EDNS) but still show info
+                if type_str == 'OPT':
+                    edns_info = add.get('edns', {})
+                    if edns_info:
+                        udp_size = edns_info.get('udp_payload_size', 'N/A')
+                        do_bit = edns_info.get('do_bit', False)
+                        lines.append(f"      EDNS: udp={udp_size} DO={do_bit}")
+                    continue
+                
+                if isinstance(rdata, dict):
+                    if type_str in ['A', 'AAAA']:
+                        lines.append(f"      {name} {ttl} IN {type_str} {rdata.get('address', 'N/A')}")
+                    elif type_str == 'NS':
+                        lines.append(f"      {name} {ttl} IN {type_str} {rdata.get('nsname', 'N/A')}")
+                    elif type_str in ['RRSIG', 'NSEC', 'NSEC3']:
+                        rdata_str = ' '.join(f'{k}={v}' for k, v in rdata.items() if v)
+                        lines.append(f"      {name} {ttl} IN {type_str} {rdata_str}")
+                    else:
+                        lines.append(f"      {name} {ttl} IN {type_str} {rdata}")
+                else:
                     lines.append(f"      {name} {ttl} IN {type_str} {rdata}")
         
         return "\n".join(lines)
