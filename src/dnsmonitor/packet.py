@@ -10,8 +10,25 @@ import dpkt
 
 # --- Packet ---
 DNS_TYPE_MAP = {
-    1: "A", 2: "NS", 5: "CNAME", 6: "SOA", 12: "PTR", 15: "MX", 16: "TXT", 28: "AAAA",
-    41: "OPT"
+    1: "A", 
+    2: "NS", 
+    5: "CNAME", 
+    6: "SOA", 
+    12: "PTR", 
+    15: "MX", 
+    16: "TXT", 
+    28: "AAAA",
+    41: "OPT", 
+    43: "DS", 
+    46: "RRSIG", 
+    47: "NSEC", 
+    48: "DNSKEY", 
+    50: "NSEC3",
+    51: "NSEC3PARAM", 
+    52: "TLSA", 
+    257: "CAA", 
+    32768: "TA", 
+    32769: "DLV"
 }
 RCODE_MAP = {
     0: "NOERROR", 1: "FORMERR", 2: "SERVFAIL", 3: "NXDOMAIN", 4: "NOTIMP", 5: "REFUSED"
@@ -241,6 +258,52 @@ class DNSPacket:
                                 result['rdata']['text'] = ""
                     except Exception:
                         result['rdata']['text'] = ""
+                elif rr.type == dpkt.dns.DNS_DS:  # DS
+                    if len(rr.rdata) >= 4:
+                        result['rdata']['key_tag'] = int.from_bytes(rr.rdata[0:2], 'big')
+                        result['rdata']['algorithm'] = rr.rdata[2]
+                        result['rdata']['digest_type'] = rr.rdata[3]
+                        result['rdata']['digest'] = rr.rdata[4:].hex() if len(rr.rdata) > 4 else ""
+                elif rr.type == dpkt.dns.DNS_DNSKEY:  # DNSKEY
+                    if len(rr.rdata) >= 4:
+                        result['rdata']['flags'] = int.from_bytes(rr.rdata[0:2], 'big')
+                        result['rdata']['protocol'] = rr.rdata[2]
+                        result['rdata']['algorithm'] = rr.rdata[3]
+                        result['rdata']['key'] = rr.rdata[4:].hex() if len(rr.rdata) > 4 else ""
+                elif rr.type == dpkt.dns.DNS_RRSIG:  # RRSIG
+                    if len(rr.rdata) >= 18:
+                        result['rdata']['type_covered'] = int.from_bytes(rr.rdata[0:2], 'big')
+                        result['rdata']['algorithm'] = rr.rdata[2]
+                        result['rdata']['labels'] = rr.rdata[3]
+                        result['rdata']['original_ttl'] = int.from_bytes(rr.rdata[4:8], 'big')
+                        result['rdata']['signature_inception'] = int.from_bytes(rr.rdata[8:12], 'big')
+                        result['rdata']['signature_expiration'] = int.from_bytes(rr.rdata[12:16], 'big')
+                        result['rdata']['key_tag'] = int.from_bytes(rr.rdata[16:18], 'big')
+                        result['rdata']['signer_name'] = self._format_name(rr.rdata[18:]) if len(rr.rdata) > 18 else ""
+                elif rr.type == dpkt.dns.DNS_NSEC:  # NSEC
+                    if rr.rdata:
+                        result['rdata']['next_domain'] = self._format_name(rr.rdata)
+                        result['rdata']['type_bitmap'] = rr.rdata.hex() if rr.rdata else ""
+                elif rr.type == dpkt.dns.DNS_NSEC3:  # NSEC3
+                    if len(rr.rdata) >= 5:
+                        result['rdata']['hash_algorithm'] = rr.rdata[0]
+                        result['rdata']['flags'] = rr.rdata[1]
+                        result['rdata']['iterations'] = int.from_bytes(rr.rdata[2:4], 'big')
+                        salt_len = rr.rdata[4]
+                        result['rdata']['salt'] = rr.rdata[5:5+salt_len].hex() if salt_len > 0 else ""
+                        result['rdata']['data'] = rr.rdata[5+salt_len:].hex() if len(rr.rdata) > 5+salt_len else ""
+                elif rr.type == 52:  # TLSA
+                    if len(rr.rdata) >= 3:
+                        result['rdata']['certificate_usage'] = rr.rdata[0]
+                        result['rdata']['selector'] = rr.rdata[1]
+                        result['rdata']['matching_type'] = rr.rdata[2]
+                        result['rdata']['association_data'] = rr.rdata[3:].hex() if len(rr.rdata) > 3 else ""
+                elif rr.type == 257:  # CAA
+                    if len(rr.rdata) >= 3:
+                        result['rdata']['flags'] = rr.rdata[0]
+                        tag_len = rr.rdata[1]
+                        result['rdata']['tag'] = rr.rdata[2:2+tag_len].decode('utf-8', errors='replace') if tag_len > 0 else ""
+                        result['rdata']['value'] = rr.rdata[2+tag_len:].decode('utf-8', errors='replace') if len(rr.rdata) > 2+tag_len else ""
                 else:
                     result['rdata']['raw'] = rr.rdata.hex() if rr.rdata else ""
             except Exception:

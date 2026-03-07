@@ -76,6 +76,7 @@ class ResolverConfig:
     resolver_ip: Optional[str] = None
     timeout: int = 3
     output_path: str = "resolve"
+    detail_mode: bool = False  # Enable detailed resource record output
 
     enable_server: bool = True
     analysis_address: str = "0.0.0.0"

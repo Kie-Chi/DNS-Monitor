@@ -177,7 +177,7 @@ class TransactionAnalyzer:
 
     @staticmethod
     def _format_rr(packet: DNSPacket) -> str:
-        """Format resource records from a packet into a readable string."""
+        """Format resource records from a packet into a readable string (brief)."""
         parts = []
         answers = packet.get_answers_list()
         authorities = packet.get_authorities_list()
@@ -210,8 +210,79 @@ class TransactionAnalyzer:
         return " ".join(parts)
 
     @staticmethod
-    def print(transaction: DNSTransaction) -> str:
-        """Generates a detailed summary of the transaction."""
+    def _format_detailed_rr(packet: DNSPacket) -> str:
+        """Format resource records from a packet into a detailed string."""
+        lines = []
+        answers = packet.get_answers_list()
+        authorities = packet.get_authorities_list()
+        additionals = packet.get_additionals_list()
+        
+        rcode_name = RCODE_MAP.get(packet.rcode, f"RCODE{packet.rcode}")
+        lines.append(f"    RCODE: {rcode_name}")
+        
+        if answers:
+            lines.append(f"    Answers ({len(answers)}):")
+            for ans in answers:
+                type_str = ans.get('type', 'UNKNOWN')
+                name = ans.get('name', '')
+                ttl = ans.get('ttl', 0)
+                rdata = ans.get('rdata', {})
+                
+                if isinstance(rdata, dict):
+                    if type_str in ['A', 'AAAA']:
+                        lines.append(f"      {name} {ttl} IN {type_str} {rdata.get('address', 'N/A')}")
+                    elif type_str == 'CNAME':
+                        lines.append(f"      {name} {ttl} IN {type_str} {rdata.get('cname', 'N/A')}")
+                    elif type_str == 'MX':
+                        lines.append(f"      {name} {ttl} IN {type_str} {rdata.get('preference', '')} {rdata.get('exchange', '')}")
+                    elif type_str == 'NS':
+                        lines.append(f"      {name} {ttl} IN {type_str} {rdata.get('nsname', 'N/A')}")
+                    elif type_str == 'TXT':
+                        lines.append(f"      {name} {ttl} IN {type_str} \"{rdata.get('text', '')}\"")
+                    elif type_str in ['DS', 'DNSKEY', 'RRSIG', 'NSEC', 'NSEC3', 'TLSA', 'CAA']:
+                        rdata_str = ' '.join(f'{k}={v}' for k, v in rdata.items() if v)
+                        lines.append(f"      {name} {ttl} IN {type_str} {rdata_str}")
+                    else:
+                        lines.append(f"      {name} {ttl} IN {type_str} {rdata}")
+                else:
+                    lines.append(f"      {name} {ttl} IN {type_str} {rdata}")
+        
+        if authorities:
+            lines.append(f"    Authority ({len(authorities)}):")
+            for auth in authorities:
+                type_str = auth.get('type', 'UNKNOWN')
+                name = auth.get('name', '')
+                ttl = auth.get('ttl', 0)
+                rdata = auth.get('rdata', {})
+                
+                if isinstance(rdata, dict) and type_str == 'NS':
+                    lines.append(f"      {name} {ttl} IN {type_str} {rdata.get('nsname', 'N/A')}")
+                else:
+                    lines.append(f"      {name} {ttl} IN {type_str} {rdata}")
+        
+        if additionals:
+            lines.append(f"    Additional ({len(additionals)}):")
+            for add in additionals:
+                type_str = add.get('type', 'UNKNOWN')
+                name = add.get('name', '')
+                ttl = add.get('ttl', 0)
+                rdata = add.get('rdata', {})
+                
+                if isinstance(rdata, dict) and type_str in ['A', 'AAAA']:
+                    lines.append(f"      {name} {ttl} IN {type_str} {rdata.get('address', 'N/A')}")
+                elif type_str != 'OPT':  # Skip OPT records
+                    lines.append(f"      {name} {ttl} IN {type_str} {rdata}")
+        
+        return "\n".join(lines)
+
+    @staticmethod
+    def print(transaction: DNSTransaction, detail_mode: bool = False) -> str:
+        """Generates a summary of the transaction.
+        
+        Args:
+            transaction: The DNS transaction to format
+            detail_mode: If True, includes detailed resource record information
+        """
         lines = []
         
         # Header
@@ -235,10 +306,16 @@ class TransactionAnalyzer:
             
             # Response line
             if step.response:
-                summary = TransactionAnalyzer._format_rr(step.response)
-                response_line = (f"<- {colorize(step.server_ip, Colors.YELLOW)}: "
-                                 f"{colorize(summary, Colors.GREEN)}")
-                lines.append(response_line)
+                if detail_mode:
+                    summary = TransactionAnalyzer._format_detailed_rr(step.response)
+                    response_line = (f"<- {colorize(step.server_ip, Colors.YELLOW)}:")
+                    lines.append(response_line)
+                    lines.append(colorize(summary, Colors.GREEN))
+                else:
+                    summary = TransactionAnalyzer._format_rr(step.response)
+                    response_line = (f"<- {colorize(step.server_ip, Colors.YELLOW)}: "
+                                     f"{colorize(summary, Colors.GREEN)}")
+                    lines.append(response_line)
             else:
                 response_line = (f"<- {colorize(step.server_ip, Colors.YELLOW)}: "
                                  f"{colorize('[TIMEOUT]', Colors.RED)}")
@@ -246,8 +323,13 @@ class TransactionAnalyzer:
         
         # Final Response to client
         if transaction.response_packet:
-            final_summary = TransactionAnalyzer._format_rr(transaction.response_packet)
-            lines.append(f"[INFO] Response to {transaction.client_ip}: {colorize(final_summary, Colors.CYAN)}")
+            if detail_mode:
+                lines.append(f"[INFO] Final Response to {transaction.client_ip}:")
+                final_summary = TransactionAnalyzer._format_detailed_rr(transaction.response_packet)
+                lines.append(colorize(final_summary, Colors.CYAN))
+            else:
+                final_summary = TransactionAnalyzer._format_rr(transaction.response_packet)
+                lines.append(f"[INFO] Response to {transaction.client_ip}: {colorize(final_summary, Colors.CYAN)}")
         else:
             lines.append(f"[INFO] {colorize('No final response to client (TIMEOUT)', Colors.RED)}")
         
@@ -611,8 +693,8 @@ class ResolverMonitor:
             self.logger.error("Output queue is full! A completed transaction was dropped.")
 
     def _print_summary(self, t: DNSTransaction):
-        """Logs a one-line summary of a processed transaction."""
-        summary_str = TransactionAnalyzer.print(t)
+        """Logs a summary of a processed transaction."""
+        summary_str = TransactionAnalyzer.print(t, detail_mode=self.config.detail_mode)
         self.logger.info(f"\n{'-'*80}\n{summary_str}\n{'-'*80}")
 
     def _print_info(self):
