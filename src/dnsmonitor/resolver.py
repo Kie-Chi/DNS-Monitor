@@ -702,6 +702,32 @@ class ResolverMonitor:
                 self.stats['timeout_trans'] += 1
                 break
         
+        # After timeout, try to collect any remaining packets that may have just arrived
+        # This ensures we capture queries that were sent right before timeout
+        grace_period = 0.1  # 100ms grace period
+        grace_deadline = time.time() + grace_period
+        while time.time() < grace_deadline:
+            try:
+                packet = self.packet_queue.get(timeout=0.05)
+                if packet is None:
+                    break
+                collected.append(packet)
+                self.logger.debug(f"Collected packet during grace period: {packet.qname}")
+                
+                # Check if we got the final response during grace period
+                if (packet.is_response and
+                    packet.src_ip == self.config.resolver_ip and
+                    packet.dst_ip == self.config.client_ip and
+                    packet.query_id == initial_query.query_id):
+                    self.logger.info("Final response received during grace period. Transaction captured.")
+                    self.stats['trans'] += 1
+                    # Update timeout_trans counter since we did get a response
+                    if 'timeout_trans' in self.stats and self.stats['timeout_trans'] > 0:
+                        self.stats['timeout_trans'] -= 1
+                    break
+            except queue.Empty:
+                break
+        
         return collected
 
     def _process_pkts(self, packets: List[DNSPacket]):
